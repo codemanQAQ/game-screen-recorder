@@ -7,6 +7,7 @@ import binascii
 import hashlib
 import itertools
 import json
+import math
 import os
 import queue
 import re
@@ -22,7 +23,7 @@ import zipfile
 import zlib
 import xml.etree.ElementTree as ElementTree
 from ctypes import wintypes
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import Menu, Tk, filedialog, messagebox, simpledialog
@@ -61,11 +62,15 @@ from script_keymap_parsers import (
 )
 from static_ffmpeg import run as static_ffmpeg_run
 from unreal_gvas_keymap import discover_gvas_player_keymap
+from unreal_pak_keymap import (
+    KrakenHelperConfig,
+    discover_default_input_from_game_directory,
+)
 import zstandard
 
 
 APP_NAME = "悬浮录屏"
-APP_VERSION = "2.20.1"
+APP_VERSION = "2.21.0"
 SCHEMA_VERSION = "2.1"
 FPS = 30.0
 BUTTON_SIZE = 84
@@ -486,6 +491,26 @@ def parse_startup_settings(
 
 
 @dataclass(frozen=True)
+class KeymapSource:
+    """Structured provenance for one physical player/default source."""
+
+    physical_path: Path
+    kind: str
+    virtual_path: str = ""
+    contributes_bindings: bool = True
+
+
+KEYMAP_AUTHORITY_UNKNOWN = "unknown"
+KEYMAP_AUTHORITY_VERIFIED_PLAYER = "verified_player"
+KEYMAP_AUTHORITY_DEFAULT_ONLY = "default_only"
+KEYMAP_AUTHORITY_MIXED_UNVERIFIED = "mixed_unverified"
+KEYMAP_APPLY_INFER = "infer"
+KEYMAP_APPLY_REPLACE = "replace"
+KEYMAP_APPLY_MERGE = "merge"
+KEYMAP_APPLY_NONE = "none"
+
+
+@dataclass(frozen=True)
 class KeymapDiscovery:
     keymap: dict[str, dict[str, str]]
     source_files: tuple[Path, ...]
@@ -498,6 +523,9 @@ class KeymapDiscovery:
     has_verified_player_config: bool = False
     has_recognized_player_file: bool = False
     blocks_heuristic_fallback: bool = False
+    source_records: tuple[KeymapSource, ...] = ()
+    binding_authority: str = KEYMAP_AUTHORITY_UNKNOWN
+    apply_mode: str = KEYMAP_APPLY_INFER
 
 
 @dataclass(frozen=True)
@@ -687,8 +715,10 @@ _INPUT_ALIASES: dict[str, tuple[str, str]] = {
     "gamepadrightshoulder": ("gamepadRightShoulder", "gamepad"),
     "rightshoulder": ("gamepadRightShoulder", "gamepad"),
     "gamepadleftthumb": ("gamepadLeftThumb", "gamepad"),
+    "gamepadleftthumbstick": ("gamepadLeftThumb", "gamepad"),
     "leftstickpress": ("gamepadLeftThumb", "gamepad"),
     "gamepadrightthumb": ("gamepadRightThumb", "gamepad"),
+    "gamepadrightthumbstick": ("gamepadRightThumb", "gamepad"),
     "rightstickpress": ("gamepadRightThumb", "gamepad"),
     "gamepadlefttrigger": ("gamepadLeftTrigger", "gamepad"),
     "lefttrigger": ("gamepadLeftTrigger", "gamepad"),
@@ -1066,24 +1096,29 @@ def _canonical_unreal_input_name(raw_key: str) -> tuple[str, str] | None:
 
 def _unreal_input_operations(
     text: str,
-) -> tuple[list[tuple[str, str, _UnrealInputBinding | None]], bool]:
+) -> tuple[list[tuple[str, str, _UnrealInputBinding | None]], bool, bool]:
     """Parse legacy Unreal array operations without assuming a particular game."""
     operations: list[tuple[str, str, _UnrealInputBinding | None]] = []
-    recognized = False
+    saw_assignment = False
+    malformed = False
     pattern = re.compile(
         r"(?im)^\s*([+\-.!]?)\s*(ActionMappings|AxisMappings)\s*=\s*"
         r"(?:\((.*?)\)|([^\r\n;]*))",
     )
     for match in pattern.finditer(text):
-        recognized = True
+        saw_assignment = True
         operator = match.group(1) or "+"
         collection = match.group(2).casefold()
         scalar_value = (match.group(4) or "").strip()
-        if operator == "!" or scalar_value.casefold() == "cleararray":
-            operations.append(("clear", collection, None))
+        if operator == "!":
+            if match.group(3) is None and scalar_value.casefold() == "cleararray":
+                operations.append(("clear", collection, None))
+            else:
+                malformed = True
             continue
         body = match.group(3)
         if body is None:
+            malformed = True
             continue
         fields: dict[str, str] = {}
         for field in re.finditer(
@@ -1096,13 +1131,27 @@ def _unreal_input_operations(
         action = fields.get("actionname") or fields.get("axisname")
         raw_key = fields.get("key")
         if not action or not raw_key:
+            malformed = True
             continue
         scale: float | None = None
         if "scale" in fields:
             try:
                 scale = float(fields["scale"])
             except ValueError:
-                pass
+                malformed = True
+                continue
+            if not math.isfinite(scale):
+                malformed = True
+                continue
+        invalid_modifier = any(
+            fields[field_name].casefold()
+            not in {"0", "1", "false", "true", "no", "yes"}
+            for field_name in ("bctrl", "balt", "bshift", "bcmd")
+            if field_name in fields
+        )
+        if invalid_modifier:
+            malformed = True
+            continue
         modifiers = tuple(
             name
             for field_name, name in (
@@ -1126,7 +1175,7 @@ def _unreal_input_operations(
                 ),
             )
         )
-    return operations, recognized
+    return operations, bool(operations), bool(saw_assignment and malformed)
 
 
 def _unreal_binding_identity(binding: _UnrealInputBinding) -> tuple[object, ...]:
@@ -1173,11 +1222,34 @@ def _apply_unreal_input_operations(
             bindings.append(binding)
 
 
+_UNREAL_DIAGNOSTIC_ACTION_TOKENS = frozenset(
+    {
+        "cheat",
+        "console",
+        "debug",
+        "developer",
+        "diagnostic",
+        "editor",
+        "profiler",
+        "test",
+    }
+)
+
+
+def _is_unreal_diagnostic_action(action: str) -> bool:
+    separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", action)
+    separated = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", separated)
+    tokens = set(re.findall(r"[a-z0-9]+", separated.casefold()))
+    return bool(tokens & _UNREAL_DIAGNOSTIC_ACTION_TOKENS)
+
+
 def _unreal_bindings_keymap(
     bindings: list[_UnrealInputBinding],
 ) -> dict[str, dict[str, str]]:
     detected: dict[str, dict[str, str]] = {}
     for binding in bindings:
+        if _is_unreal_diagnostic_action(binding.action):
+            continue
         canonical = _canonical_unreal_input_name(binding.raw_key)
         if canonical is None:
             continue
@@ -1193,7 +1265,9 @@ def _unreal_bindings_keymap(
 
 def _parse_unreal_input_ini(text: str) -> dict[str, dict[str, str]]:
     bindings: list[_UnrealInputBinding] = []
-    operations, _recognized = _unreal_input_operations(text)
+    operations, _recognized, malformed = _unreal_input_operations(text)
+    if malformed:
+        return {}
     _apply_unreal_input_operations(bindings, operations)
     return _unreal_bindings_keymap(bindings)
 
@@ -4522,6 +4596,17 @@ def _unreal_localappdata_user_option_candidates(
     return candidates, truncated
 
 
+def _unreal_kraken_helper_config() -> KrakenHelperConfig:
+    """Use the same bundled EXE as an isolated decoder worker when frozen."""
+
+    if getattr(sys, "frozen", False):
+        return KrakenHelperConfig(
+            (sys.executable, "--internal-unreal-kraken-helper"),
+            timeout_seconds=12.0,
+        )
+    return KrakenHelperConfig()
+
+
 def discover_unreal_keymap(game_directory: Path) -> KeymapDiscovery:
     """Resolve tightly matched Unreal GVAS/Input.ini player settings and defaults."""
     install_configs, identities, truncated = (
@@ -4559,32 +4644,162 @@ def discover_unreal_keymap(game_directory: Path) -> KeymapDiscovery:
             has_verified_player_config=True,
             has_recognized_player_file=True,
             blocks_heuristic_fallback=True,
+            source_records=(
+                (
+                    KeymapSource(
+                        gvas_result.source_file,
+                        "verified_player",
+                    ),
+                )
+                if gvas_result.source_file is not None
+                else ()
+            ),
+            binding_authority=KEYMAP_AUTHORITY_VERIFIED_PLAYER,
+            apply_mode=KEYMAP_APPLY_REPLACE,
         )
+
+    # A player save that explicitly contains a key-config section but uses an
+    # unknown layout is more authoritative than plausible installation
+    # defaults.  Refuse to hide that unknown current-player state with a Pak
+    # fallback.
+    if gvas_result.recognized and gvas_result.has_key_config:
+        source_files = (
+            (gvas_result.source_file,) if gvas_result.source_file else ()
+        )
+        return KeymapDiscovery(
+            {},
+            source_files,
+            gvas_result.scanned_files,
+            truncated,
+            False,
+            notice=gvas_result.diagnostic,
+            has_recognized_player_file=True,
+            blocks_heuristic_fallback=True,
+            source_records=(
+                (
+                    KeymapSource(
+                        gvas_result.source_file,
+                        "unmapped_player_file",
+                        contributes_bindings=False,
+                    ),
+                )
+                if gvas_result.source_file is not None
+                else ()
+            ),
+            apply_mode=KEYMAP_APPLY_NONE,
+        )
+
+    pak_result = discover_default_input_from_game_directory(
+        game_directory,
+        kraken_helper=_unreal_kraken_helper_config(),
+    )
+    truncated = truncated or pak_result.truncated
     bindings: list[_UnrealInputBinding] = []
     sources: list[Path] = []
-    scanned = gvas_result.scanned_files
-    for path in install_configs:
-        scanned += 1
+    source_records: list[KeymapSource] = []
+    scanned = gvas_result.scanned_files + pak_result.scanned_paks
+    install_recognized = False
+    loose_default_recognized = False
+    invalid_install_configs: list[Path] = []
+
+    def apply_install_configs(paths: list[Path]) -> None:
+        nonlocal scanned, install_recognized, loose_default_recognized
+        for path in paths:
+            scanned += 1
+            try:
+                operations, recognized, malformed = _unreal_input_operations(
+                    _read_game_config(path)
+                )
+            except (OSError, ValueError):
+                invalid_install_configs.append(path)
+                continue
+            if malformed:
+                invalid_install_configs.append(path)
+                continue
+            if not recognized:
+                continue
+            _apply_unreal_input_operations(bindings, operations)
+            sources.append(path)
+            source_records.append(KeymapSource(path, "loose_default"))
+            install_recognized = True
+            if path.name.casefold() == "defaultinput.ini":
+                loose_default_recognized = True
+
+    # BaseInput precedes the project's packaged DefaultInput.  A loose project
+    # config is then allowed to patch the packaged baseline.
+    base_configs = [
+        path for path in install_configs
+        if path.name.casefold() == "baseinput.ini"
+    ]
+    project_configs = [
+        path for path in install_configs
+        if path.name.casefold() != "baseinput.ini"
+    ]
+    apply_install_configs(base_configs)
+
+    packaged_default_recognized = False
+    pak_parse_failure = ""
+    if pak_result.found:
         try:
-            operations, recognized = _unreal_input_operations(
-                _read_game_config(path)
+            operations, recognized, malformed = _unreal_input_operations(
+                pak_result.config_text
             )
-        except (OSError, ValueError):
-            continue
-        if not recognized:
-            continue
-        _apply_unreal_input_operations(bindings, operations)
-        sources.append(path)
+        except ValueError as exc:
+            recognized = False
+            malformed = True
+            operations = []
+            pak_parse_failure = f"DefaultInput.ini 解析失败：{exc}"
+        if recognized and not malformed:
+            _apply_unreal_input_operations(bindings, operations)
+            packaged_default_recognized = True
+            for path in pak_result.source_paks:
+                sources.append(path)
+                source_records.append(
+                    KeymapSource(
+                        path,
+                        "pak_default",
+                        virtual_path=pak_result.internal_path,
+                    )
+                )
+        elif not pak_parse_failure:
+            pak_parse_failure = (
+                "已验证游戏安装包中的 DefaultInput.ini，但其中没有可安全读取的 "
+                "ActionMappings/AxisMappings，未采用该默认键位。"
+            )
+
+    apply_install_configs(project_configs)
+
+    if gvas_result.source_file is not None and gvas_result.recognized:
+        sources.append(gvas_result.source_file)
+        source_records.append(
+            KeymapSource(
+                gvas_result.source_file,
+                "unmapped_player_file",
+                contributes_bindings=False,
+            )
+        )
 
     authoritative = False
     unmapped_player_config: Path | None = None
+    invalid_player_config: Path | None = None
+    invalid_player_detail = ""
     for path in player_configs:
         scanned += 1
         try:
             player_text = _read_game_config(path)
-            operations, recognized = _unreal_input_operations(player_text)
+            operations, recognized, malformed = _unreal_input_operations(
+                player_text
+            )
         except (OSError, ValueError):
-            continue
+            invalid_player_config = path
+            invalid_player_detail = "该文件无法在安全大小和编码限制内完整读取"
+            break
+        if malformed:
+            invalid_player_config = path
+            invalid_player_detail = (
+                "其中存在无法完整解析的 ActionMappings/AxisMappings 语法"
+            )
+            break
         if not recognized:
             # A number of Unreal games create an Input.ini containing only a
             # section header/comments on first run, then serialize bindings only
@@ -4592,24 +4807,327 @@ def discover_unreal_keymap(game_directory: Path) -> KeymapDiscovery:
             # the UI does not claim that the game has never been launched.
             if unmapped_player_config is None:
                 unmapped_player_config = path
-            continue
+            # Candidates are newest-first.  A newer, valid-but-empty current
+            # file must not be replaced by stale bindings from an older UE
+            # platform directory after an engine migration.
+            break
         _apply_unreal_input_operations(bindings, operations)
         sources.append(path)
+        source_records.append(KeymapSource(path, "verified_player"))
         authoritative = True
         break
     detected = _unreal_bindings_keymap(bindings)
+    pak_failure = pak_result.error_code or pak_parse_failure
+    install_failure = (
+        "无法完整解析后置的安装目录输入配置："
+        + "、".join(str(path) for path in dict.fromkeys(invalid_install_configs))
+        if invalid_install_configs
+        else ""
+    )
+    baseline_failure_details = []
+    if pak_failure:
+        baseline_failure_details.append(
+            pak_parse_failure or pak_result.diagnostic or str(pak_failure)
+        )
+    if install_failure:
+        baseline_failure_details.append(install_failure)
+    baseline_failure_detail = "；".join(baseline_failure_details)
+    baseline_failure = bool(baseline_failure_details)
+    has_complete_default_baseline = bool(
+        packaged_default_recognized or loose_default_recognized
+    )
+    if invalid_player_config is not None:
+        sources.append(invalid_player_config)
+        failure_records = [
+            KeymapSource(
+                record.physical_path,
+                (
+                    "unapplied_pak_default"
+                    if record.kind == "pak_default"
+                    else "unapplied_loose_default"
+                    if record.kind == "loose_default"
+                    else record.kind
+                ),
+                virtual_path=record.virtual_path,
+                contributes_bindings=False,
+            )
+            for record in source_records
+        ]
+        failure_records.append(
+            KeymapSource(
+                invalid_player_config,
+                "invalid_player_config",
+                contributes_bindings=False,
+            )
+        )
+        failure_source_paths = (
+            *(pak_result.source_paks if pak_failure else ()),
+            *invalid_install_configs,
+        )
+        for path in failure_source_paths:
+            if path not in sources:
+                sources.append(path)
+            if not any(
+                record.physical_path == path for record in failure_records
+            ):
+                failure_records.append(
+                    KeymapSource(
+                        path,
+                        (
+                            "pak_default_error"
+                            if path in pak_result.source_paks
+                            else "loose_default_error"
+                        ),
+                        virtual_path=(
+                            pak_result.internal_path
+                            if path in pak_result.source_paks
+                            else ""
+                        ),
+                        contributes_bindings=False,
+                    )
+                )
+        baseline_detail = (
+            f" 同时，默认键位基线也无法安全读取："
+            f"{baseline_failure_detail}"
+            if baseline_failure
+            else ""
+        )
+        return KeymapDiscovery(
+            {},
+            tuple(dict.fromkeys(sources)),
+            scanned,
+            truncated,
+            False,
+            notice=(
+                f"已找到玩家 Input.ini，但{invalid_player_detail}："
+                f"{invalid_player_config}。"
+                f"{baseline_detail} 为避免把默认值误报为玩家实际配置，本次没有载入任何键位。"
+            ),
+            has_recognized_player_file=True,
+            blocks_heuristic_fallback=True,
+            source_records=tuple(dict.fromkeys(failure_records)),
+            apply_mode=KEYMAP_APPLY_NONE,
+        )
+    if authoritative and baseline_failure:
+        # Unreal Input.ini normally stores array operations relative to
+        # DefaultInput rather than a complete standalone table.  If the Pak
+        # baseline could not be authenticated/decompressed, returning only the
+        # player's delta would silently drop every unchanged action.
+        failure_records = [
+            KeymapSource(
+                record.physical_path,
+                (
+                    "unapplied_player_override"
+                    if record.kind == "verified_player"
+                    else "unapplied_pak_default"
+                    if record.kind == "pak_default"
+                    else "unapplied_loose_default"
+                    if record.kind == "loose_default"
+                    else record.kind
+                ),
+                virtual_path=record.virtual_path,
+                contributes_bindings=False,
+            )
+            for record in source_records
+        ]
+        failure_source_paths = (
+            *(pak_result.source_paks if pak_failure else ()),
+            *invalid_install_configs,
+        )
+        for path in failure_source_paths:
+            sources.append(path)
+            failure_records.append(
+                KeymapSource(
+                    path,
+                    (
+                        "pak_default_error"
+                        if path in pak_result.source_paks
+                        else "loose_default_error"
+                    ),
+                    virtual_path=(
+                        pak_result.internal_path
+                        if path in pak_result.source_paks
+                        else ""
+                    ),
+                    contributes_bindings=False,
+                )
+            )
+        failure_detail = baseline_failure_detail
+        return KeymapDiscovery(
+            {},
+            tuple(dict.fromkeys(sources)),
+            scanned,
+            truncated,
+            False,
+            notice=(
+                "已找到玩家 Input.ini，但该文件是相对于游戏 DefaultInput 的增量配置。"
+                f"当前无法安全读取完整默认基线：{failure_detail} "
+                "为避免遗漏所有未改动作，本次没有载入任何键位。"
+            ),
+            has_recognized_player_file=True,
+            blocks_heuristic_fallback=True,
+            source_records=tuple(dict.fromkeys(failure_records)),
+            apply_mode=KEYMAP_APPLY_NONE,
+        )
+    if authoritative and not has_complete_default_baseline:
+        partial_records = tuple(
+            KeymapSource(
+                record.physical_path,
+                (
+                    "unverified_player_override"
+                    if record.kind == "verified_player"
+                    else record.kind
+                ),
+                virtual_path=record.virtual_path,
+                contributes_bindings=record.contributes_bindings,
+            )
+            for record in source_records
+        )
+        return KeymapDiscovery(
+            detected,
+            tuple(dict.fromkeys(sources)),
+            scanned,
+            truncated,
+            False,
+            notice=(
+                "已找到玩家 Input.ini，但没有找到可完整验证的游戏 DefaultInput 基线。"
+                "Unreal Input.ini 通常只保存相对于默认表的增量操作，因此当前只能读取"
+                "其中明确出现的部分绑定，不能把它视为完整玩家键位。"
+            ),
+            has_recognized_player_file=True,
+            blocks_heuristic_fallback=True,
+            source_records=partial_records,
+            binding_authority=KEYMAP_AUTHORITY_MIXED_UNVERIFIED,
+            apply_mode=(
+                KEYMAP_APPLY_MERGE if detected else KEYMAP_APPLY_NONE
+            ),
+        )
     if authoritative:
         return KeymapDiscovery(
             detected,
-            tuple(sources),
+            tuple(dict.fromkeys(sources)),
             scanned,
             truncated,
             True,
+            notice=(
+                "已将玩家 Input.ini 应用于游戏默认键位。"
+                if packaged_default_recognized or install_recognized
+                else "已读取玩家 Input.ini 键位配置。"
+            ),
             has_verified_player_config=True,
+            has_recognized_player_file=True,
+            blocks_heuristic_fallback=True,
+            source_records=tuple(dict.fromkeys(source_records)),
+            binding_authority=KEYMAP_AUTHORITY_VERIFIED_PLAYER,
+            apply_mode=KEYMAP_APPLY_REPLACE,
         )
+
+    recognized_player_file = bool(
+        gvas_result.recognized or unmapped_player_config is not None
+    )
+    if unmapped_player_config is not None:
+        sources.append(unmapped_player_config)
+        source_records.append(
+            KeymapSource(
+                unmapped_player_config,
+                "unmapped_player_file",
+                contributes_bindings=False,
+            )
+        )
+
+    if baseline_failure:
+        abandoned_records = [
+            KeymapSource(
+                record.physical_path,
+                (
+                    "unapplied_loose_default"
+                    if record.kind == "loose_default"
+                    else "unapplied_pak_default"
+                    if record.kind == "pak_default"
+                    else record.kind
+                ),
+                virtual_path=record.virtual_path,
+                contributes_bindings=False,
+            )
+            for record in source_records
+        ]
+        source_records = abandoned_records
+        failure_source_paths = (
+            *(pak_result.source_paks if pak_failure else ()),
+            *invalid_install_configs,
+        )
+        for path in failure_source_paths:
+            sources.append(path)
+            source_records.append(
+                KeymapSource(
+                    path,
+                    (
+                        "pak_default_error"
+                        if path in pak_result.source_paks
+                        else "loose_default_error"
+                    ),
+                    virtual_path=(
+                        pak_result.internal_path
+                        if path in pak_result.source_paks
+                        else ""
+                    ),
+                    contributes_bindings=False,
+                )
+            )
+        failure_notice = baseline_failure_detail
+        if gvas_result.recognized and gvas_result.diagnostic:
+            failure_notice = (
+                f"{gvas_result.diagnostic}\n\n"
+                f"同时无法安全读取游戏安装包默认键位：{failure_notice}"
+            )
+        return KeymapDiscovery(
+            {},
+            tuple(dict.fromkeys(sources)),
+            scanned,
+            truncated,
+            False,
+            notice=failure_notice,
+            has_recognized_player_file=recognized_player_file,
+            blocks_heuristic_fallback=True,
+            source_records=tuple(dict.fromkeys(source_records)),
+            apply_mode=KEYMAP_APPLY_NONE,
+        )
+
+    has_install_default = install_recognized or packaged_default_recognized
+    if has_install_default:
+        default_origin = (
+            "已验证并读取游戏安装包中的 DefaultInput.ini 默认键位。"
+            if packaged_default_recognized
+            else "已读取游戏安装目录中的 Unreal 默认键位。"
+        )
+        player_state = ""
+        if gvas_result.recognized and gvas_result.diagnostic:
+            player_state = f"\n{gvas_result.diagnostic}"
+        elif unmapped_player_config is not None:
+            player_state = (
+                "\n已找到玩家 Input.ini，但其中尚未保存 ActionMappings/"
+                "AxisMappings 键位记录。"
+            )
+        notice = (
+            f"{default_origin}{player_state}\n"
+            "当前载入内容是游戏内置默认值，不是玩家实际改键记录；"
+            "DefaultInput.ini 只提供英文动作标识，不能自动生成可靠的中文动作语义。"
+            "请对照游戏内键位设置逐项核对并改为中文，未完成前不能继续录制。"
+        )
+        return KeymapDiscovery(
+            detected,
+            tuple(dict.fromkeys(sources)),
+            scanned,
+            truncated,
+            True,
+            notice=notice,
+            has_recognized_player_file=recognized_player_file,
+            source_records=tuple(dict.fromkeys(source_records)),
+            binding_authority=KEYMAP_AUTHORITY_DEFAULT_ONLY,
+            apply_mode=KEYMAP_APPLY_REPLACE,
+        )
+
     if gvas_result.recognized:
-        if gvas_result.source_file is not None:
-            sources.append(gvas_result.source_file)
         return KeymapDiscovery(
             detected,
             tuple(dict.fromkeys(sources)),
@@ -4619,11 +5137,11 @@ def discover_unreal_keymap(game_directory: Path) -> KeymapDiscovery:
             notice=gvas_result.diagnostic,
             has_recognized_player_file=True,
             blocks_heuristic_fallback=gvas_result.has_key_config,
+            source_records=tuple(dict.fromkeys(source_records)),
+            apply_mode=KEYMAP_APPLY_NONE if not detected else KEYMAP_APPLY_MERGE,
         )
     notice = ""
     if unmapped_player_config is not None:
-        if not detected:
-            sources.append(unmapped_player_config)
         notice = (
             "已找到玩家 Input.ini，但文件中尚无 ActionMappings/AxisMappings "
             "键位记录。仅启动并退出游戏不一定会保存默认键位；请进入游戏的按键设置，"
@@ -4636,6 +5154,9 @@ def discover_unreal_keymap(game_directory: Path) -> KeymapDiscovery:
         truncated,
         False,
         notice=notice,
+        has_recognized_player_file=unmapped_player_config is not None,
+        source_records=tuple(dict.fromkeys(source_records)),
+        apply_mode=KEYMAP_APPLY_NONE if not detected else KEYMAP_APPLY_MERGE,
     )
 
 
@@ -6200,6 +6721,25 @@ def discover_external_player_keymap(
     )
 
 
+def _with_executed_scan_metadata(
+    discovery: KeymapDiscovery,
+    *previously_executed: KeymapDiscovery,
+) -> KeymapDiscovery:
+    """Preserve counts/limits from every discovery that already ran this turn."""
+
+    return replace(
+        discovery,
+        scanned_files=(
+            discovery.scanned_files
+            + sum(item.scanned_files for item in previously_executed)
+        ),
+        truncated=(
+            discovery.truncated
+            or any(item.truncated for item in previously_executed)
+        ),
+    )
+
+
 def discover_keymap_from_game_directory(directory: Path) -> KeymapDiscovery:
     root = directory.resolve()
     if not root.is_dir():
@@ -6253,20 +6793,30 @@ def discover_keymap_from_game_directory(directory: Path) -> KeymapDiscovery:
     # before this result is marked verified.  It therefore replaces templates,
     # including when the player's valid file intentionally binds no actions.
     if numeric_ini_result.has_verified_player_config:
-        return numeric_ini_discovery
+        return _with_executed_scan_metadata(
+            numeric_ini_discovery,
+            foundation_discovery,
+        )
     # Once an executable has authoritatively declared this player-file format,
     # do not let broad installation-tree scanners mistake defaults for current
     # player state.  A missing file must retain its first-launch guidance; an
     # invalid existing file must retain the parser's precise safety diagnostic.
     if numeric_ini_result.recognized:
-        return numeric_ini_discovery
+        return _with_executed_scan_metadata(
+            numeric_ini_discovery,
+            foundation_discovery,
+        )
     player_files = discover_player_config_files(
         root,
         _is_external_player_keymap_candidate,
     )
     external_player = discover_external_player_keymap(root, player_files)
     if external_player.recognized_config:
-        return external_player
+        return _with_executed_scan_metadata(
+            external_player,
+            foundation_discovery,
+            numeric_ini_discovery,
+        )
     has_external_override = bool(
         external_player.keymap or external_player.overridden_actions
     )
@@ -6274,30 +6824,112 @@ def discover_keymap_from_game_directory(directory: Path) -> KeymapDiscovery:
     # defaults (including otherwise authoritative JSON/XML/Valve templates).
     unreal_discovery = discover_unreal_keymap(root)
     if unreal_discovery.has_verified_player_config:
-        return unreal_discovery
+        return _with_executed_scan_metadata(
+            unreal_discovery,
+            foundation_discovery,
+            numeric_ini_discovery,
+            external_player,
+        )
     if (
         unreal_discovery.blocks_heuristic_fallback
-        and not has_external_override
+        and unreal_discovery.apply_mode == KEYMAP_APPLY_NONE
     ):
         # The player save contains a KeyConfigSettings section, but its future
-        # layout could not be consumed safely.  Do not mask actual unknown
-        # player state with plausible-looking installation defaults.
-        return unreal_discovery
+        # layout could not be consumed safely, or an exact Pak default could
+        # not be validated completely.  Do not mask unknown state with a
+        # plausible-looking generic installation scan.
+        return _with_executed_scan_metadata(
+            unreal_discovery,
+            foundation_discovery,
+            numeric_ini_discovery,
+            external_player,
+        )
+    if unreal_discovery.binding_authority == KEYMAP_AUTHORITY_DEFAULT_ONLY:
+        if not has_external_override:
+            # An authenticated Unreal DefaultInput is more precise than generic
+            # install-tree JSON/XML/CFG matches and must win before those scans.
+            return _with_executed_scan_metadata(
+                unreal_discovery,
+                foundation_discovery,
+                numeric_ini_discovery,
+                external_player,
+            )
+        mixed = {
+            input_name: dict(mapping)
+            for input_name, mapping in unreal_discovery.keymap.items()
+        }
+        _remove_overridden_actions(mixed, external_player.overridden_actions)
+        _merge_keymap_records(mixed, external_player.keymap)
+        mixed_sources = tuple(
+            dict.fromkeys(
+                (*unreal_discovery.source_files, *external_player.source_files)
+            )
+        )
+        mixed_records = tuple(
+            dict.fromkeys(
+                (
+                    *unreal_discovery.source_records,
+                    *(
+                        KeymapSource(path, "unverified_player_override")
+                        for path in external_player.source_files
+                    ),
+                )
+            )
+        )
+        mixed_discovery = KeymapDiscovery(
+            mixed,
+            mixed_sources,
+            unreal_discovery.scanned_files + external_player.scanned_files,
+            unreal_discovery.truncated or external_player.truncated,
+            True,
+            unreal_discovery.overridden_actions
+            | external_player.overridden_actions,
+            notice=(
+                f"{unreal_discovery.notice}\n"
+                "另合并了通用玩家配置候选中的部分覆盖；由于无法证明其完整性，"
+                "最终键位仍须逐项人工核对。"
+            ),
+            has_recognized_player_file=bool(
+                unreal_discovery.has_recognized_player_file
+                or external_player.source_files
+            ),
+            source_records=mixed_records,
+            binding_authority=KEYMAP_AUTHORITY_MIXED_UNVERIFIED,
+            apply_mode=KEYMAP_APPLY_REPLACE,
+        )
+        return _with_executed_scan_metadata(
+            mixed_discovery,
+            foundation_discovery,
+            numeric_ini_discovery,
+        )
+    if unreal_discovery.binding_authority == KEYMAP_AUTHORITY_MIXED_UNVERIFIED:
+        # This is already a tightly matched Unreal player delta whose complete
+        # baseline is unavailable.  Preserve it as an explicitly partial,
+        # manual-review result instead of mixing in unrelated generic scans.
+        return _with_executed_scan_metadata(
+            unreal_discovery,
+            foundation_discovery,
+            numeric_ini_discovery,
+            external_player,
+        )
     # Complete external player configs outrank format defaults. Partial generic
     # scans are deliberately not mixed into this schema because their English
     # action labels cannot safely override the verified Chinese action table.
     if foundation_authoritative:
-        return KeymapDiscovery(
-            foundation_discovery.keymap,
-            foundation_discovery.source_files,
-            foundation_discovery.scanned_files + external_player.scanned_files,
-            foundation_discovery.truncated or external_player.truncated,
-            True,
+        selected_foundation = replace(
+            foundation_discovery,
+            recognized_config=True,
             notice=foundation_discovery.notice,
             requires_game_launch=foundation_discovery.requires_game_launch,
             has_verified_player_config=(
                 foundation_discovery.has_verified_player_config
             ),
+        )
+        return _with_executed_scan_metadata(
+            selected_foundation,
+            numeric_ini_discovery,
+            external_player,
+            unreal_discovery,
         )
     structured_json = discover_structured_json_keymaps(
         root,
@@ -6315,15 +6947,44 @@ def discover_keymap_from_game_directory(directory: Path) -> KeymapDiscovery:
         structured_json.authoritative
         and not has_external_override
     ):
-        return structured_discovery
+        return _with_executed_scan_metadata(
+            structured_discovery,
+            foundation_discovery,
+            numeric_ini_discovery,
+            external_player,
+            unreal_discovery,
+        )
     indexed_discovery = discover_indexed_xml_keymap(root)
     if indexed_discovery.recognized_config and not has_external_override:
-        return indexed_discovery
+        return _with_executed_scan_metadata(
+            indexed_discovery,
+            foundation_discovery,
+            numeric_ini_discovery,
+            external_player,
+            unreal_discovery,
+            structured_discovery,
+        )
     valve_discovery = discover_valve_keymap(root)
     if valve_discovery.recognized_config and not has_external_override:
-        return valve_discovery
+        return _with_executed_scan_metadata(
+            valve_discovery,
+            foundation_discovery,
+            numeric_ini_discovery,
+            external_player,
+            unreal_discovery,
+            structured_discovery,
+            indexed_discovery,
+        )
     if unreal_discovery.recognized_config and not has_external_override:
-        return unreal_discovery
+        return _with_executed_scan_metadata(
+            unreal_discovery,
+            foundation_discovery,
+            numeric_ini_discovery,
+            external_player,
+            structured_discovery,
+            indexed_discovery,
+            valve_discovery,
+        )
     special_discoveries = (
         structured_discovery,
         valve_discovery,
@@ -6418,7 +7079,7 @@ def discover_keymap_from_game_directory(directory: Path) -> KeymapDiscovery:
                 truncated = truncated or keyvalues.truncated
                 if keyvalues.recognized_config:
                     if _is_complete_keyvalues_config(path, keyvalues.format_name):
-                        return KeymapDiscovery(
+                        complete_keyvalues = KeymapDiscovery(
                             keyvalues.keymap,
                             (path,),
                             sum(
@@ -6432,6 +7093,12 @@ def discover_keymap_from_game_directory(directory: Path) -> KeymapDiscovery:
                                 for discovery in special_discoveries
                             ),
                             True,
+                        )
+                        return _with_executed_scan_metadata(
+                            complete_keyvalues,
+                            foundation_discovery,
+                            numeric_ini_discovery,
+                            external_player,
                         )
                     parsed = keyvalues.keymap
             if not parsed and path.suffix.casefold() in {".json", ".inputactions"}:
@@ -6476,7 +7143,7 @@ def discover_keymap_from_game_directory(directory: Path) -> KeymapDiscovery:
                     and path.name.casefold()
                     in {"config_player.xml", "keyprefs.xml", "settings.celeste"}
                 ):
-                    return KeymapDiscovery(
+                    complete_xml = KeymapDiscovery(
                         parsed_xml.keymap,
                         (path,),
                         sum(
@@ -6490,6 +7157,12 @@ def discover_keymap_from_game_directory(directory: Path) -> KeymapDiscovery:
                             for discovery in special_discoveries
                         ),
                         True,
+                    )
+                    return _with_executed_scan_metadata(
+                        complete_xml,
+                        foundation_discovery,
+                        numeric_ini_discovery,
+                        external_player,
                     )
                 parsed = parsed_xml.keymap
             elif not parsed and path.suffix.casefold() in {".yaml", ".yml"}:
@@ -6548,6 +7221,7 @@ def discover_keymap_from_game_directory(directory: Path) -> KeymapDiscovery:
         external_player,
         manual_discovery,
         foundation_discovery,
+        numeric_ini_discovery,
     )
     other_recognized = any(
         discovery.recognized_config
@@ -6570,6 +7244,11 @@ def discover_keymap_from_game_directory(directory: Path) -> KeymapDiscovery:
         "请先启动游戏、进入按键设置，实际修改并应用至少一个键位后正常退出，"
         "然后重新选择游戏目录。"
     )
+    aggregated_source_records: list[KeymapSource] = []
+    for discovery in all_discoveries:
+        for record in discovery.source_records:
+            if record not in aggregated_source_records:
+                aggregated_source_records.append(record)
     return KeymapDiscovery(
         detected,
         tuple(sources),
@@ -6592,6 +7271,7 @@ def discover_keymap_from_game_directory(directory: Path) -> KeymapDiscovery:
         has_recognized_player_file=(
             unreal_discovery.has_recognized_player_file
         ),
+        source_records=tuple(aggregated_source_records),
     )
 
 
@@ -6600,9 +7280,20 @@ def _apply_keymap_discovery(
     discovery: KeymapDiscovery,
 ) -> dict[str, dict[str, str]]:
     """Apply complete player configs by replacement and partial scans by merge."""
+    apply_mode = discovery.apply_mode
+    if apply_mode == KEYMAP_APPLY_INFER:
+        apply_mode = (
+            KEYMAP_APPLY_REPLACE
+            if discovery.recognized_config
+            else KEYMAP_APPLY_MERGE
+        )
+    if apply_mode == KEYMAP_APPLY_NONE:
+        return {key: dict(value) for key, value in current.items()}
+    if apply_mode not in {KEYMAP_APPLY_REPLACE, KEYMAP_APPLY_MERGE}:
+        raise ValueError(f"未知键位应用模式：{apply_mode}")
     applied = (
         {}
-        if discovery.recognized_config
+        if apply_mode == KEYMAP_APPLY_REPLACE
         else {key: dict(value) for key, value in current.items()}
     )
     applied.update(
@@ -6616,8 +7307,16 @@ def _keymap_requires_player_config_confirmation(
     discovery: KeymapDiscovery,
 ) -> bool:
     """Return true when only install/default sources support a detected config."""
-    if discovery.has_verified_player_config:
+    if (
+        discovery.has_verified_player_config
+        or discovery.binding_authority == KEYMAP_AUTHORITY_VERIFIED_PLAYER
+    ):
         return False
+    if discovery.binding_authority in {
+        KEYMAP_AUTHORITY_DEFAULT_ONLY,
+        KEYMAP_AUTHORITY_MIXED_UNVERIFIED,
+    }:
+        return bool(discovery.keymap or discovery.recognized_config)
     if discovery.has_recognized_player_file:
         return bool(discovery.keymap)
     if not discovery.keymap and not discovery.recognized_config:
@@ -6639,6 +7338,34 @@ def _keymap_requires_player_config_confirmation(
         except (OSError, RuntimeError):
             continue
     return True
+
+
+def _keymap_source_display_labels(
+    game_directory: Path,
+    discovery: KeymapDiscovery,
+) -> list[str]:
+    """Render physical and optional archive-virtual provenance without fake Paths."""
+
+    labels: list[str] = []
+    if discovery.source_records:
+        records = discovery.source_records
+    else:
+        records = tuple(
+            KeymapSource(path, "legacy") for path in discovery.source_files
+        )
+    for record in records[:5]:
+        path = record.physical_path
+        try:
+            physical = str(path.relative_to(game_directory))
+        except (ValueError, OSError, RuntimeError):
+            physical = path.name or str(path)
+        virtual = record.virtual_path.strip().replace("\\", "/")
+        label = f"{physical}!{virtual}" if virtual else physical
+        if label not in labels:
+            labels.append(label)
+    if len(records) > 5:
+        labels.append(f"……另有 {len(records) - 5} 个来源")
+    return labels
 
 
 @dataclass(frozen=True)
@@ -7601,8 +8328,33 @@ class InputEventTracker:
             modifier for modifier in cls._CHORD_MODIFIERS if modifier in held_keys
         ]
         if active_modifiers:
-            chord = "+".join((*active_modifiers, key))
-            return chord if chord in keymap else None
+            active_set = set(active_modifiers)
+            candidates: list[tuple[int, str]] = []
+            for mapping_key in keymap:
+                parts = mapping_key.split("+")
+                if len(parts) < 2 or parts[-1] != key:
+                    continue
+                required = parts[:-1]
+                if (
+                    all(part in cls._CHORD_MODIFIERS for part in required)
+                    and set(required).issubset(active_set)
+                ):
+                    candidates.append((len(required), mapping_key))
+            if candidates:
+                best_size = max(size for size, _mapping_key in candidates)
+                best = [
+                    mapping_key
+                    for size, mapping_key in candidates
+                    if size == best_size
+                ]
+                if len(best) == 1:
+                    return best[0]
+                # Two equally specific modifier bindings are ambiguous.  Do not
+                # invent an action when the game may resolve them differently.
+                return None
+            # Extra held modifiers must not suppress a configured plain binding;
+            # this is common while Shift-sprinting and pressing movement keys.
+            return key if key in keymap else None
         return key if key in keymap else None
 
     @classmethod
@@ -7619,9 +8371,27 @@ class InputEventTracker:
             if modifier in held_modifiers
         ]
         if active_modifiers:
-            chord = "+".join((*active_modifiers, pointing_input))
-            if chord in keymap:
-                return chord
+            active_set = set(active_modifiers)
+            candidates: list[tuple[int, str]] = []
+            for mapping_key in keymap:
+                parts = mapping_key.split("+")
+                if len(parts) < 2 or parts[-1] != pointing_input:
+                    continue
+                required = parts[:-1]
+                if (
+                    all(part in cls._CHORD_MODIFIERS for part in required)
+                    and set(required).issubset(active_set)
+                ):
+                    candidates.append((len(required), mapping_key))
+            if candidates:
+                best_size = max(size for size, _mapping_key in candidates)
+                best = [
+                    mapping_key
+                    for size, mapping_key in candidates
+                    if size == best_size
+                ]
+                if len(best) == 1:
+                    return best[0]
         # A modifier that has no matching mouse chord must not suppress an
         # existing plain mouse binding.  This preserves the recorder's prior
         # behaviour for games where, for example, Shift and attack overlap.
@@ -10444,11 +11214,24 @@ class SessionConfigDialog(simpledialog.Dialog):
                     "该游戏可能使用二进制/加密格式。请保留模板并手动修改，"
                     "也可以使用“导入Keymap”。"
                 )
-            if discovery.has_recognized_player_file and discovery.source_files:
+            player_source_paths = [
+                record.physical_path
+                for record in discovery.source_records
+                if record.kind in {
+                    "verified_player",
+                    "unmapped_player_file",
+                    "invalid_player_config",
+                    "unapplied_player_override",
+                    "unverified_player_override",
+                }
+            ]
+            if discovery.has_recognized_player_file and player_source_paths:
                 scan_summary = (
                     "已解析玩家配置文件："
-                    f"{discovery.source_files[-1]}"
+                    f"{player_source_paths[-1]}"
                 )
+            elif discovery.has_recognized_player_file:
+                scan_summary = "已识别玩家配置状态，但没有可载入的完整玩家键位。"
             else:
                 scan_summary = (
                     f"已解析 {discovery.scanned_files} 个候选文件或可执行文件"
@@ -10478,21 +11261,70 @@ class SessionConfigDialog(simpledialog.Dialog):
             _keymap_requires_player_config_confirmation(directory, discovery)
         )
         if requires_player_confirmation:
+            # The current table is not verified player state.  Keep the final
+            # review gate enabled even when the user declines to load defaults.
+            self._keymap_needs_manual_confirmation = True
             warning_detail = discovery.notice or (
                 "当前只检测到安装目录或程序内置的默认键位。"
             )
+            is_packaged_default = any(
+                record.kind == "pak_default"
+                for record in discovery.source_records
+            )
+            is_partial_player_delta = bool(
+                discovery.binding_authority == KEYMAP_AUTHORITY_MIXED_UNVERIFIED
+                and any(
+                    record.kind == "unverified_player_override"
+                    for record in discovery.source_records
+                )
+            )
+            confirmation_title = (
+                "仅检测到游戏打包默认键位"
+                if is_packaged_default
+                else "仅检测到不完整的玩家键位增量"
+                if is_partial_player_delta
+                else "未找到玩家实际键位"
+            )
+            source_description = (
+                "工具已从经过完整性校验的游戏 Pak 安装包中读取默认键位，"
+                "但这不是玩家实际改键记录。"
+                if is_packaged_default
+                else
+                "工具已读取玩家 Input.ini 中明确保存的增量绑定，但没有找到"
+                "完整 DefaultInput 基线，因此无法恢复未改动的键位。"
+                if is_partial_player_delta
+                else
+                "当前未找到可验证的玩家实际键位配置（注册表、配置文件或云存档），"
+                "工具只能载入安装目录或程序内置的默认键位。"
+            )
+            confirmation_question = (
+                "是否仍要把这部分玩家键位增量合并到当前表格？"
+                if is_partial_player_delta
+                else "是否仍要载入默认键位？"
+            )
+            mapping_warning = (
+                "该增量只包含玩家改动过的项目；直接使用会遗漏未改动作，导致"
+                "生成的 JSON 动作与实际按键不对应。"
+                if is_partial_player_delta
+                else
+                "默认键位可能与游戏中的实际设置不一致；直接开始录制可能导致"
+                "生成的 JSON 动作与实际按键不对应。"
+            )
+            recommendation = (
+                "建议点击“否”，改为导入完整 Keymap，或先手工补齐并逐项核对。"
+                if is_partial_player_delta
+                else
+                "建议点击“否”，先启动游戏、进入按键设置，实际修改并应用至少一个键位后"
+                "正常退出，再重新选择游戏目录。"
+            )
             use_default_keymap = messagebox.askyesno(
-                "未找到玩家实际键位",
+                confirmation_title,
                 (
-                    "当前未找到可验证的玩家实际键位配置（注册表、配置文件或云存档），"
-                    "工具只能载入安装目录或程序内置的默认键位。\n"
-                    "默认键位可能与游戏中的实际设置不一致；直接开始录制可能导致"
-                    "生成的 JSON 动作与实际按键不对应。\n\n"
-                    "建议点击“否”，先启动游戏、进入按键设置，实际修改并应用至少一个键位后"
-                    "正常退出，再重新选择"
-                    "游戏目录。\n\n"
+                    f"{source_description}\n"
+                    f"{mapping_warning}\n\n"
+                    f"{recommendation}\n\n"
                     f"检测详情：{warning_detail}\n\n"
-                    "是否仍要载入默认键位？"
+                    f"{confirmation_question}"
                 ),
                 icon=messagebox.WARNING,
                 default=messagebox.NO,
@@ -10506,23 +11338,25 @@ class SessionConfigDialog(simpledialog.Dialog):
             current = {}
         applied = _apply_keymap_discovery(current, discovery)
         self._set_keymap(applied)
-        self._keymap_needs_manual_confirmation = False
+        # Accepting installation/default bindings only authorizes loading them
+        # into the editor.  It does not prove that they match the player's
+        # current in-game settings, so keep the final, default-NO manual review
+        # gate enabled until validate().  A verified player config can clear it.
+        self._keymap_needs_manual_confirmation = requires_player_confirmation
         if not self.game_title_entry.get().strip():
             self.game_title_entry.insert(0, directory.name)
-        displayed_sources = []
-        for path in discovery.source_files[:5]:
-            try:
-                displayed_sources.append(str(path.relative_to(directory)))
-            except ValueError:
-                displayed_sources.append(path.name)
-        if len(discovery.source_files) > 5:
-            displayed_sources.append(f"……另有 {len(discovery.source_files) - 5} 个文件")
+        displayed_sources = _keymap_source_display_labels(directory, discovery)
         source_text = (
             "\n".join(f"• {source}" for source in displayed_sources)
             if displayed_sources
             else "• 未提供文件路径"
         )
-        limit_notice = "\n注意：目录扫描达到安全上限。" if discovery.truncated else ""
+        limit_notice = (
+            "\n注意：部分候选来源因时间、数量、深度或文件大小安全上限未完成检查，"
+            "结果可能不完整。"
+            if discovery.truncated
+            else ""
+        )
         parser_notice = f"\n\n{discovery.notice}" if discovery.notice else ""
         if discovery.recognized_config and not discovery.keymap:
             if requires_player_confirmation:

@@ -19,6 +19,8 @@ import screen_recorder as recorder
 from foundation_registry_keymap import RegistryKeymapResult
 from fromsoftware_numeric_ini_keymap import NumericIniDiscoveryResult
 from player_config_paths import PlayerConfigDiscovery, PlayerConfigRoot
+from unreal_gvas_keymap import GvasPlayerKeymapResult
+from unreal_pak_keymap import UnrealPakDefaultInputResult
 
 from screen_recorder import (
     InputEventTracker,
@@ -714,6 +716,14 @@ class RecorderLogicTests(unittest.TestCase):
             recorder._canonical_input_name("Shift+K"),
             ("Shift+K", "keyboard"),
         )
+        self.assertEqual(
+            recorder._canonical_input_name("Gamepad_LeftThumbstick"),
+            ("gamepadLeftThumb", "gamepad"),
+        )
+        self.assertEqual(
+            recorder._canonical_input_name("Gamepad_RightThumbstick"),
+            ("gamepadRightThumb", "gamepad"),
+        )
         self.assertIsNone(recorder._canonical_input_name("leftClick+rightClick"))
 
     def test_session_config_validation_blocks_english_action_semantics(self) -> None:
@@ -1287,6 +1297,20 @@ class RecorderLogicTests(unittest.TestCase):
             1,
             False,
         )
+        explicit_replace = KeymapDiscovery(
+            {"F": {"type": "keyboard", "action": "Use"}},
+            (),
+            1,
+            False,
+            apply_mode=recorder.KEYMAP_APPLY_REPLACE,
+        )
+        no_application = KeymapDiscovery(
+            {"F": {"type": "keyboard", "action": "Use"}},
+            (),
+            1,
+            False,
+            apply_mode=recorder.KEYMAP_APPLY_NONE,
+        )
 
         self.assertEqual(
             _apply_keymap_discovery(current, authoritative),
@@ -1296,6 +1320,14 @@ class RecorderLogicTests(unittest.TestCase):
         self.assertEqual(
             set(_apply_keymap_discovery(current, partial)),
             {"W", "E"},
+        )
+        self.assertEqual(
+            _apply_keymap_discovery(current, explicit_replace),
+            explicit_replace.keymap,
+        )
+        self.assertEqual(
+            _apply_keymap_discovery(current, no_application),
+            current,
         )
 
     def test_foundation_live_registry_is_highest_priority_even_when_empty(self) -> None:
@@ -1538,6 +1570,7 @@ class RecorderLogicTests(unittest.TestCase):
         self.assertIn("安装目录或程序内置的默认键位", askyesno.call_args.args[1])
         self.assertIn("JSON 动作与实际按键不对应", askyesno.call_args.args[1])
         self.assertEqual(askyesno.call_args.kwargs["default"], recorder.messagebox.NO)
+        self.assertTrue(dialog._keymap_needs_manual_confirmation)
         showinfo.assert_not_called()
 
     def test_game_directory_defaults_apply_after_confirmation(self) -> None:
@@ -1593,7 +1626,122 @@ class RecorderLogicTests(unittest.TestCase):
         askyesno.assert_called_once()
         self.assertEqual(applied, [default_map])
         self.assertEqual(dialog.game_title_entry.value, Path(directory).name)
+        self.assertTrue(dialog._keymap_needs_manual_confirmation)
         showinfo.assert_called_once()
+
+    def test_pak_default_acceptance_still_requires_final_manual_confirmation(
+        self,
+    ) -> None:
+        class EntryStub:
+            def __init__(self) -> None:
+                self.value = ""
+
+            def get(self) -> str:
+                return self.value
+
+            def insert(self, _index: int, value: str) -> None:
+                self.value = value
+
+        with tempfile.TemporaryDirectory() as directory:
+            game = Path(directory)
+            pak = game / "Demo.pak"
+            default_map = {
+                "Space": {"type": "keyboard", "action": "跳跃"}
+            }
+            discovery = KeymapDiscovery(
+                default_map,
+                (pak,),
+                1,
+                False,
+                True,
+                notice="已从 Pak 读取游戏内置默认键位，并非玩家实际键位。",
+                source_records=(
+                    recorder.KeymapSource(
+                        pak,
+                        "pak_default",
+                        "Demo/Config/DefaultInput.ini",
+                    ),
+                ),
+                binding_authority=recorder.KEYMAP_AUTHORITY_DEFAULT_ONLY,
+                apply_mode=recorder.KEYMAP_APPLY_REPLACE,
+            )
+            table = {
+                "W": {"type": "keyboard", "action": "前进"}
+            }
+            dialog = recorder.SessionConfigDialog.__new__(
+                recorder.SessionConfigDialog
+            )
+            dialog.configure = lambda **_kwargs: None
+            dialog.update_idletasks = lambda: None
+            dialog.game_title_entry = EntryStub()
+            dialog.result = None
+            dialog._keymap_needs_manual_confirmation = False
+            dialog._keymap_document = lambda: {
+                key: dict(value) for key, value in table.items()
+            }
+
+            def set_keymap(value: dict[str, dict[str, str]]) -> None:
+                table.clear()
+                table.update(
+                    {key: dict(mapping) for key, mapping in value.items()}
+                )
+
+            dialog._set_keymap = set_keymap
+
+            with (
+                patch.object(
+                    recorder.filedialog,
+                    "askdirectory",
+                    return_value=directory,
+                ),
+                patch.object(
+                    recorder,
+                    "discover_keymap_from_game_directory",
+                    return_value=discovery,
+                ),
+                patch.object(
+                    recorder.messagebox,
+                    "askyesno",
+                    side_effect=(True, False, True),
+                ) as askyesno,
+                patch.object(recorder.messagebox, "showinfo"),
+            ):
+                dialog._discover_from_game_directory()
+                self.assertEqual(table, default_map)
+                self.assertTrue(dialog._keymap_needs_manual_confirmation)
+
+                self.assertFalse(dialog.validate())
+                self.assertIsNone(dialog.result)
+                self.assertTrue(dialog._keymap_needs_manual_confirmation)
+                self.assertTrue(dialog.validate())
+
+        self.assertEqual(askyesno.call_count, 3)
+        self.assertEqual(
+            askyesno.call_args_list[0].args[0],
+            "仅检测到游戏打包默认键位",
+        )
+        self.assertIn(
+            "这不是玩家实际改键记录",
+            askyesno.call_args_list[0].args[1],
+        )
+        self.assertEqual(
+            askyesno.call_args_list[0].kwargs["default"],
+            recorder.messagebox.NO,
+        )
+        self.assertEqual(
+            askyesno.call_args_list[1].args[0],
+            "确认已人工核对键位",
+        )
+        self.assertEqual(
+            askyesno.call_args_list[1].kwargs["default"],
+            recorder.messagebox.NO,
+        )
+        self.assertEqual(
+            askyesno.call_args_list[2].args[0],
+            "确认已人工核对键位",
+        )
+        self.assertFalse(dialog._keymap_needs_manual_confirmation)
+        self.assertEqual(dialog.result.keymap, default_map)
 
     def test_game_directory_live_keymap_skips_default_warning(self) -> None:
         class EntryStub:
@@ -1643,6 +1791,7 @@ class RecorderLogicTests(unittest.TestCase):
         askyesno.assert_not_called()
         self.assertEqual(applied, [live_map])
         self.assertEqual(dialog.game_title_entry.value, "已有名称")
+        self.assertFalse(dialog._keymap_needs_manual_confirmation)
         showinfo.assert_called_once()
 
     def test_install_default_without_launch_flag_still_requires_confirmation(
@@ -1679,6 +1828,22 @@ class RecorderLogicTests(unittest.TestCase):
                 False,
                 recognized_config=True,
             )
+            explicit_mixed_default = KeymapDiscovery(
+                mapping,
+                (game / "Content.pak", root / "profile" / "partial.ini"),
+                2,
+                False,
+                recognized_config=True,
+                binding_authority=recorder.KEYMAP_AUTHORITY_MIXED_UNVERIFIED,
+            )
+            explicit_verified = KeymapDiscovery(
+                mapping,
+                (game / "Content.pak",),
+                1,
+                False,
+                recognized_config=True,
+                binding_authority=recorder.KEYMAP_AUTHORITY_VERIFIED_PLAYER,
+            )
 
             self.assertTrue(
                 recorder._keymap_requires_player_config_confirmation(
@@ -1704,6 +1869,43 @@ class RecorderLogicTests(unittest.TestCase):
                     empty_install_default,
                 )
             )
+            self.assertTrue(
+                recorder._keymap_requires_player_config_confirmation(
+                    game,
+                    explicit_mixed_default,
+                )
+            )
+            self.assertFalse(
+                recorder._keymap_requires_player_config_confirmation(
+                    game,
+                    explicit_verified,
+                )
+            )
+
+    def test_pak_source_display_keeps_physical_and_virtual_provenance(self) -> None:
+        game = Path("C:/Games/Demo")
+        pak = game / "Demo" / "Content" / "Paks" / "Demo-Windows.pak"
+        discovery = KeymapDiscovery(
+            {"W": {"type": "keyboard", "action": "前进"}},
+            (pak,),
+            1,
+            False,
+            source_records=(
+                recorder.KeymapSource(
+                    pak,
+                    "pak_default",
+                    "Demo\\Config\\DefaultInput.ini",
+                ),
+            ),
+        )
+
+        self.assertEqual(
+            recorder._keymap_source_display_labels(game, discovery),
+            [
+                "Demo\\Content\\Paks\\Demo-Windows.pak!"
+                "Demo/Config/DefaultInput.ini"
+            ],
+        )
 
     def test_missing_player_keymap_shows_launch_warning(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1744,9 +1946,10 @@ class RecorderLogicTests(unittest.TestCase):
 
     def test_specific_player_config_notice_is_shown_without_generic_claims(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            player_path = Path(directory) / "Input.ini"
             discovery = KeymapDiscovery(
                 {},
-                (Path(directory) / "Input.ini",),
+                (player_path,),
                 1,
                 False,
                 notice=(
@@ -1755,6 +1958,13 @@ class RecorderLogicTests(unittest.TestCase):
                 ),
                 requires_game_launch=False,
                 has_recognized_player_file=True,
+                source_records=(
+                    recorder.KeymapSource(
+                        player_path,
+                        "unmapped_player_file",
+                        contributes_bindings=False,
+                    ),
+                ),
             )
             dialog = recorder.SessionConfigDialog.__new__(
                 recorder.SessionConfigDialog
@@ -1871,7 +2081,10 @@ class RecorderLogicTests(unittest.TestCase):
             ):
                 result = discover_keymap_from_game_directory(Path(directory))
 
-        self.assertIs(result, external)
+        self.assertEqual(result.keymap, external.keymap)
+        self.assertEqual(result.source_files, external.source_files)
+        self.assertEqual(result.scanned_files, 2)
+        self.assertFalse(result.truncated)
 
     def test_foundation_schema_without_safe_map_preserves_template_and_guidance(
         self,
@@ -3409,6 +3622,23 @@ Tab
             self.assertEqual(result.keymap["leftClick"]["action"], "Fire")
             self.assertEqual(len(result.source_files), 1)
 
+    def test_unreal_diagnostic_actions_are_filtered_by_exact_tokens(self) -> None:
+        parsed = recorder._parse_unreal_input_ini(
+            "\n".join(
+                (
+                    '+ActionMappings=(ActionName="DebugWindow",Key=O,bAlt=True,bShift=True)',
+                    '+ActionMappings=(ActionName="DeveloperConsole",Key=Tilde)',
+                    '+ActionMappings=(ActionName="ContestAction",Key=C)',
+                    '+ActionMappings=(ActionName="OpenInventory",Key=I)',
+                )
+            )
+        )
+
+        self.assertNotIn("Alt+Shift+O", parsed)
+        self.assertNotIn("Tilde", parsed)
+        self.assertEqual(parsed["C"]["action"], "ContestAction")
+        self.assertEqual(parsed["I"]["action"], "OpenInventory")
+
     def test_unreal_localappdata_profile_overrides_defaults_and_keeps_chords(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3534,6 +3764,807 @@ Tab
             self.assertFalse(result.requires_game_launch)
             self.assertEqual(result.notice, unreal.notice)
             self.assertIn(player_input.resolve(), result.source_files)
+            self.assertIn(
+                recorder.KeymapSource(
+                    player_input.resolve(),
+                    "unmapped_player_file",
+                    contributes_bindings=False,
+                ),
+                result.source_records,
+            )
+
+    def test_unreal_verified_gvas_short_circuits_packaged_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            game = Path(directory)
+            player_save = game / "UserOption.sav"
+            verified_gvas = GvasPlayerKeymapResult(
+                {
+                    "Space": {
+                        "type": "keyboard",
+                        "action": "跳跃",
+                    }
+                },
+                True,
+                True,
+                False,
+                "已读取当前玩家实际键位。",
+                source_file=player_save,
+                has_verified_player_config=True,
+                mapping_count=1,
+                scanned_files=1,
+                has_key_config=True,
+            )
+
+            with (
+                patch.object(
+                    recorder,
+                    "_unreal_install_candidates_and_identities",
+                    return_value=([], {"Demo"}, False),
+                ),
+                patch.object(
+                    recorder,
+                    "_unreal_localappdata_user_option_candidates",
+                    return_value=([player_save], False),
+                ),
+                patch.object(
+                    recorder,
+                    "discover_gvas_player_keymap",
+                    return_value=verified_gvas,
+                ),
+                patch.object(
+                    recorder,
+                    "_unreal_localappdata_input_candidates",
+                    return_value=([], False),
+                ),
+                patch.object(
+                    recorder,
+                    "discover_default_input_from_game_directory",
+                    side_effect=AssertionError(
+                        "已验证的 GVAS 不应继续扫描 Pak 默认键位"
+                    ),
+                    create=True,
+                ) as discover_pak,
+            ):
+                result = recorder.discover_unreal_keymap(game)
+
+        discover_pak.assert_not_called()
+        self.assertEqual(result.keymap, verified_gvas.keymap)
+        self.assertTrue(result.has_verified_player_config)
+        self.assertEqual(
+            result.binding_authority,
+            recorder.KEYMAP_AUTHORITY_VERIFIED_PLAYER,
+        )
+        self.assertEqual(result.apply_mode, recorder.KEYMAP_APPLY_REPLACE)
+        self.assertEqual(result.source_files, (player_save,))
+        self.assertEqual(len(result.source_records), 1)
+        self.assertEqual(result.source_records[0].physical_path, player_save)
+        self.assertTrue(result.source_records[0].contributes_bindings)
+
+    def test_unreal_pak_default_only_has_explicit_provenance_and_authority(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            game = Path(directory)
+            player_save = game / "UserOption.sav"
+            pak = game / "Demo" / "Content" / "Paks" / "Demo.pak"
+            no_key_config = GvasPlayerKeymapResult(
+                {},
+                True,
+                True,
+                True,
+                "玩家存档尚未序列化 KeyConfigSettings。",
+                source_file=player_save,
+                scanned_files=1,
+                has_key_config=False,
+            )
+            packaged_default = UnrealPakDefaultInputResult(
+                config_text=(
+                    "[/Script/Engine.InputSettings]\n"
+                    '+ActionMappings=(ActionName="Jump",Key=SpaceBar)\n'
+                ),
+                found=True,
+                recognized_pak=True,
+                source_paks=(pak,),
+                internal_path="Demo/Config/DefaultInput.ini",
+                pak_version=11,
+                pak_layout="path_hash_index",
+                compression_method="zlib",
+                diagnostic="已读取 Pak 中的游戏默认键位。",
+                scanned_paks=2,
+            )
+
+            with (
+                patch.object(
+                    recorder,
+                    "_unreal_install_candidates_and_identities",
+                    return_value=([], {"Demo"}, False),
+                ),
+                patch.object(
+                    recorder,
+                    "_unreal_localappdata_user_option_candidates",
+                    return_value=([player_save], False),
+                ),
+                patch.object(
+                    recorder,
+                    "discover_gvas_player_keymap",
+                    return_value=no_key_config,
+                ),
+                patch.object(
+                    recorder,
+                    "_unreal_localappdata_input_candidates",
+                    return_value=([], False),
+                ),
+                patch.object(
+                    recorder,
+                    "discover_default_input_from_game_directory",
+                    return_value=packaged_default,
+                    create=True,
+                ) as discover_pak,
+            ):
+                result = recorder.discover_unreal_keymap(game)
+
+        self.assertEqual(discover_pak.call_count, 1)
+        self.assertEqual(discover_pak.call_args.args[0], game)
+        self.assertTrue(result.recognized_config)
+        self.assertFalse(result.has_verified_player_config)
+        self.assertEqual(result.keymap["Space"]["action"], "Jump")
+        self.assertEqual(
+            result.binding_authority,
+            recorder.KEYMAP_AUTHORITY_DEFAULT_ONLY,
+        )
+        self.assertEqual(result.apply_mode, recorder.KEYMAP_APPLY_REPLACE)
+        self.assertEqual(result.source_files, (pak, player_save))
+        self.assertEqual(result.scanned_files, 3)
+        pak_sources = [
+            source
+            for source in result.source_records
+            if source.kind == "pak_default"
+        ]
+        self.assertEqual(len(pak_sources), 1)
+        self.assertEqual(pak_sources[0].physical_path, pak)
+        self.assertEqual(
+            pak_sources[0].virtual_path,
+            "Demo/Config/DefaultInput.ini",
+        )
+        self.assertTrue(pak_sources[0].contributes_bindings)
+        unmapped_sources = [
+            source
+            for source in result.source_records
+            if source.physical_path == player_save
+        ]
+        self.assertEqual(len(unmapped_sources), 1)
+        self.assertFalse(unmapped_sources[0].contributes_bindings)
+        self.assertTrue(
+            recorder._keymap_requires_player_config_confirmation(game, result)
+        )
+
+    def test_unreal_player_input_overrides_pak_baseline_and_is_verified(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            game = Path(directory)
+            pak = game / "Demo" / "Content" / "Paks" / "Demo.pak"
+            player_input = game / "Player" / "Input.ini"
+            player_input.parent.mkdir()
+            player_input.write_text(
+                "\n".join(
+                    (
+                        '-ActionMappings=(ActionName="Jump",Key=SpaceBar)',
+                        '+ActionMappings=(ActionName="Jump",Key=J)',
+                    )
+                ),
+                encoding="utf-8",
+            )
+            packaged_default = UnrealPakDefaultInputResult(
+                config_text="\n".join(
+                    (
+                        "[/Script/Engine.InputSettings]",
+                        '+ActionMappings=(ActionName="Jump",Key=SpaceBar)',
+                        '+ActionMappings=(ActionName="Interact",Key=E)',
+                    )
+                ),
+                found=True,
+                recognized_pak=True,
+                source_paks=(pak,),
+                internal_path="Demo/Config/DefaultInput.ini",
+                diagnostic="已读取 Pak 默认键位。",
+                scanned_paks=1,
+            )
+
+            with (
+                patch.object(
+                    recorder,
+                    "_unreal_install_candidates_and_identities",
+                    return_value=([], {"Demo"}, False),
+                ),
+                patch.object(
+                    recorder,
+                    "_unreal_localappdata_user_option_candidates",
+                    return_value=([], False),
+                ),
+                patch.object(
+                    recorder,
+                    "discover_gvas_player_keymap",
+                    return_value=GvasPlayerKeymapResult(
+                        {}, False, False, False, ""
+                    ),
+                ),
+                patch.object(
+                    recorder,
+                    "_unreal_localappdata_input_candidates",
+                    return_value=([player_input], False),
+                ),
+                patch.object(
+                    recorder,
+                    "discover_default_input_from_game_directory",
+                    return_value=packaged_default,
+                    create=True,
+                ),
+            ):
+                result = recorder.discover_unreal_keymap(game)
+
+        self.assertTrue(result.recognized_config)
+        self.assertTrue(result.has_verified_player_config)
+        self.assertNotIn("Space", result.keymap)
+        self.assertEqual(result.keymap["J"]["action"], "Jump")
+        self.assertEqual(result.keymap["E"]["action"], "Interact")
+        self.assertEqual(
+            result.binding_authority,
+            recorder.KEYMAP_AUTHORITY_VERIFIED_PLAYER,
+        )
+        self.assertEqual(result.apply_mode, recorder.KEYMAP_APPLY_REPLACE)
+        self.assertEqual(result.source_files, (pak, player_input))
+        self.assertEqual(len(result.source_records), 2)
+        self.assertEqual(result.source_records[0].kind, "pak_default")
+        self.assertEqual(result.source_records[0].physical_path, pak)
+        self.assertEqual(result.source_records[1].physical_path, player_input)
+        self.assertTrue(result.source_records[1].contributes_bindings)
+        self.assertFalse(
+            recorder._keymap_requires_player_config_confirmation(game, result)
+        )
+
+    def test_unreal_unsupported_active_gvas_blocks_pak_and_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            game = Path(directory)
+            player_save = game / "UserOption.sav"
+            unsupported_gvas = GvasPlayerKeymapResult(
+                {},
+                True,
+                True,
+                False,
+                "玩家键位存档使用尚不支持的结构。",
+                source_file=player_save,
+                unsupported_schema=True,
+                scanned_files=1,
+                has_key_config=True,
+            )
+
+            with (
+                patch.object(
+                    recorder,
+                    "_unreal_install_candidates_and_identities",
+                    return_value=([], {"Demo"}, False),
+                ),
+                patch.object(
+                    recorder,
+                    "_unreal_localappdata_user_option_candidates",
+                    return_value=([player_save], False),
+                ),
+                patch.object(
+                    recorder,
+                    "discover_gvas_player_keymap",
+                    return_value=unsupported_gvas,
+                ),
+                patch.object(
+                    recorder,
+                    "_unreal_localappdata_input_candidates",
+                    return_value=([], False),
+                ),
+                patch.object(
+                    recorder,
+                    "discover_default_input_from_game_directory",
+                    side_effect=AssertionError(
+                        "活动玩家键位结构未知时不得载入 Pak 默认值"
+                    ),
+                    create=True,
+                ) as discover_pak,
+            ):
+                result = recorder.discover_unreal_keymap(game)
+
+        discover_pak.assert_not_called()
+        self.assertEqual(result.keymap, {})
+        self.assertFalse(result.recognized_config)
+        self.assertTrue(result.blocks_heuristic_fallback)
+        self.assertEqual(result.apply_mode, recorder.KEYMAP_APPLY_NONE)
+        self.assertEqual(result.source_files, (player_save,))
+        self.assertEqual(len(result.source_records), 1)
+        self.assertFalse(result.source_records[0].contributes_bindings)
+
+    def test_unreal_oodle_failure_blocks_fallback_without_modifying_keymap(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            game = Path(directory)
+            pak = game / "Demo" / "Content" / "Paks" / "Demo.pak"
+            oodle_failure = UnrealPakDefaultInputResult(
+                found=False,
+                recognized_pak=True,
+                source_paks=(pak,),
+                diagnostic="Pak 使用 Oodle Kraken，但解码帮助程序不可用。",
+                error_code="kraken_decoder_unavailable",
+                scanned_paks=1,
+            )
+
+            with (
+                patch.object(
+                    recorder,
+                    "_unreal_install_candidates_and_identities",
+                    return_value=([], {"Demo"}, False),
+                ),
+                patch.object(
+                    recorder,
+                    "_unreal_localappdata_user_option_candidates",
+                    return_value=([], False),
+                ),
+                patch.object(
+                    recorder,
+                    "discover_gvas_player_keymap",
+                    return_value=GvasPlayerKeymapResult(
+                        {}, False, False, False, ""
+                    ),
+                ),
+                patch.object(
+                    recorder,
+                    "_unreal_localappdata_input_candidates",
+                    return_value=([], False),
+                ),
+                patch.object(
+                    recorder,
+                    "discover_default_input_from_game_directory",
+                    return_value=oodle_failure,
+                    create=True,
+                ),
+            ):
+                result = recorder.discover_unreal_keymap(game)
+
+        current = {"W": {"type": "keyboard", "action": "前进"}}
+        self.assertEqual(result.keymap, {})
+        self.assertFalse(result.recognized_config)
+        self.assertTrue(result.blocks_heuristic_fallback)
+        self.assertEqual(result.apply_mode, recorder.KEYMAP_APPLY_NONE)
+        self.assertIn("Oodle Kraken", result.notice)
+        self.assertEqual(result.source_files, (pak,))
+        self.assertEqual(len(result.source_records), 1)
+        self.assertFalse(result.source_records[0].contributes_bindings)
+        self.assertEqual(_apply_keymap_discovery(current, result), current)
+
+    def test_unreal_player_delta_cannot_hide_failed_pak_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            game = Path(directory)
+            player_input = game / "Player" / "Input.ini"
+            player_input.parent.mkdir()
+            player_input.write_text(
+                '+ActionMappings=(ActionName="Jump",Key=J)',
+                encoding="utf-8",
+            )
+            pak = game / "Demo" / "Content" / "Paks" / "Demo.pak"
+            pak_failure = UnrealPakDefaultInputResult(
+                found=False,
+                recognized_pak=True,
+                source_paks=(pak,),
+                diagnostic="Pak 索引哈希校验失败。",
+                error_code="index_hash_mismatch",
+                scanned_paks=1,
+            )
+
+            with (
+                patch.object(
+                    recorder,
+                    "_unreal_install_candidates_and_identities",
+                    return_value=([], {"Demo"}, False),
+                ),
+                patch.object(
+                    recorder,
+                    "_unreal_localappdata_user_option_candidates",
+                    return_value=([], False),
+                ),
+                patch.object(
+                    recorder,
+                    "discover_gvas_player_keymap",
+                    return_value=GvasPlayerKeymapResult(
+                        {}, False, False, False, ""
+                    ),
+                ),
+                patch.object(
+                    recorder,
+                    "_unreal_localappdata_input_candidates",
+                    return_value=([player_input], False),
+                ),
+                patch.object(
+                    recorder,
+                    "discover_default_input_from_game_directory",
+                    return_value=pak_failure,
+                    create=True,
+                ),
+            ):
+                result = recorder.discover_unreal_keymap(game)
+
+        self.assertEqual({}, result.keymap)
+        self.assertFalse(result.recognized_config)
+        self.assertFalse(result.has_verified_player_config)
+        self.assertTrue(result.has_recognized_player_file)
+        self.assertTrue(result.blocks_heuristic_fallback)
+        self.assertEqual(recorder.KEYMAP_APPLY_NONE, result.apply_mode)
+        self.assertIn("增量配置", result.notice)
+        self.assertIn("索引哈希校验失败", result.notice)
+        self.assertTrue(
+            all(not source.contributes_bindings for source in result.source_records)
+        )
+
+    def test_unreal_clear_syntax_is_strict_and_malformed_is_rejected(self) -> None:
+        operations, recognized, malformed = recorder._unreal_input_operations(
+            "!ActionMappings=ClearArray"
+        )
+        self.assertTrue(recognized)
+        self.assertFalse(malformed)
+        self.assertEqual([("clear", "actionmappings", None)], operations)
+
+        for text in (
+            "!ActionMappings=garbage",
+            "!ActionMappings=(broken)",
+            "ActionMappings=ClearArray",
+            "ActionMappings=garbage",
+            'AxisMappings=(AxisName="MoveForward",Key=W,Scale=NaN)',
+            'AxisMappings=(AxisName="MoveForward",Key=W,Scale=Infinity)',
+        ):
+            operations, recognized, malformed = recorder._unreal_input_operations(
+                text
+            )
+            self.assertEqual([], operations, text)
+            self.assertFalse(recognized, text)
+            self.assertTrue(malformed, text)
+
+    def test_malformed_player_input_cannot_promote_pak_default_to_verified(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            game = Path(directory)
+            player_input = game / "Player" / "Input.ini"
+            player_input.parent.mkdir()
+            player_input.write_text(
+                "ActionMappings=malformed",
+                encoding="utf-8",
+            )
+            pak = game / "Game.pak"
+            pak_result = UnrealPakDefaultInputResult(
+                config_text=(
+                    '+ActionMappings=(ActionName="Jump",Key=Space)'
+                ),
+                found=True,
+                recognized_pak=True,
+                source_paks=(pak,),
+                internal_path="Demo/Config/DefaultInput.ini",
+                scanned_paks=1,
+            )
+            with (
+                patch.object(
+                    recorder,
+                    "_unreal_install_candidates_and_identities",
+                    return_value=([], {"Demo"}, False),
+                ),
+                patch.object(
+                    recorder,
+                    "_unreal_localappdata_user_option_candidates",
+                    return_value=([], False),
+                ),
+                patch.object(
+                    recorder,
+                    "discover_gvas_player_keymap",
+                    return_value=GvasPlayerKeymapResult(
+                        {}, False, False, False, ""
+                    ),
+                ),
+                patch.object(
+                    recorder,
+                    "_unreal_localappdata_input_candidates",
+                    return_value=([player_input], False),
+                ),
+                patch.object(
+                    recorder,
+                    "discover_default_input_from_game_directory",
+                    return_value=pak_result,
+                ),
+            ):
+                result = recorder.discover_unreal_keymap(game)
+
+        self.assertEqual({}, result.keymap)
+        self.assertFalse(result.has_verified_player_config)
+        self.assertEqual(recorder.KEYMAP_APPLY_NONE, result.apply_mode)
+        self.assertTrue(result.blocks_heuristic_fallback)
+        self.assertIn("无法完整解析", result.notice)
+
+    def test_malformed_loose_default_abandons_valid_pak_without_duplication(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            game = Path(directory)
+            loose_default = game / "Config" / "DefaultInput.ini"
+            loose_default.parent.mkdir()
+            loose_default.write_text(
+                "ActionMappings=malformed",
+                encoding="utf-8",
+            )
+            pak = game / "Game.pak"
+            pak_result = UnrealPakDefaultInputResult(
+                config_text=(
+                    '+ActionMappings=(ActionName="Jump",Key=Space)'
+                ),
+                found=True,
+                recognized_pak=True,
+                source_paks=(pak,),
+                internal_path="Demo/Config/DefaultInput.ini",
+                scanned_paks=1,
+            )
+            with (
+                patch.object(
+                    recorder,
+                    "_unreal_install_candidates_and_identities",
+                    return_value=([loose_default], {"Demo"}, False),
+                ),
+                patch.object(
+                    recorder,
+                    "_unreal_localappdata_user_option_candidates",
+                    return_value=([], False),
+                ),
+                patch.object(
+                    recorder,
+                    "discover_gvas_player_keymap",
+                    return_value=GvasPlayerKeymapResult(
+                        {}, False, False, False, ""
+                    ),
+                ),
+                patch.object(
+                    recorder,
+                    "_unreal_localappdata_input_candidates",
+                    return_value=([], False),
+                ),
+                patch.object(
+                    recorder,
+                    "discover_default_input_from_game_directory",
+                    return_value=pak_result,
+                ),
+            ):
+                result = recorder.discover_unreal_keymap(game)
+
+        self.assertEqual({}, result.keymap)
+        self.assertEqual(recorder.KEYMAP_APPLY_NONE, result.apply_mode)
+        provenance = [
+            (record.physical_path, record.kind, record.contributes_bindings)
+            for record in result.source_records
+        ]
+        self.assertEqual(
+            [
+                (pak, "unapplied_pak_default", False),
+                (loose_default, "loose_default_error", False),
+            ],
+            provenance,
+        )
+
+    def test_newer_empty_player_input_blocks_stale_older_bindings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            game = Path(directory)
+            newer = game / "Player" / "Windows" / "Input.ini"
+            older = game / "Player" / "WindowsNoEditor" / "Input.ini"
+            newer.parent.mkdir(parents=True)
+            older.parent.mkdir(parents=True)
+            newer.write_text(
+                "[/Script/Engine.InputSettings]\n; current empty state\n",
+                encoding="utf-8",
+            )
+            older.write_text(
+                '+ActionMappings=(ActionName="OldJump",Key=J)',
+                encoding="utf-8",
+            )
+            pak = game / "Game.pak"
+            pak_result = UnrealPakDefaultInputResult(
+                config_text=(
+                    '+ActionMappings=(ActionName="Jump",Key=Space)'
+                ),
+                found=True,
+                recognized_pak=True,
+                source_paks=(pak,),
+                internal_path="Demo/Config/DefaultInput.ini",
+                scanned_paks=1,
+            )
+            with (
+                patch.object(
+                    recorder,
+                    "_unreal_install_candidates_and_identities",
+                    return_value=([], {"Demo"}, False),
+                ),
+                patch.object(
+                    recorder,
+                    "_unreal_localappdata_user_option_candidates",
+                    return_value=([], False),
+                ),
+                patch.object(
+                    recorder,
+                    "discover_gvas_player_keymap",
+                    return_value=GvasPlayerKeymapResult(
+                        {}, False, False, False, ""
+                    ),
+                ),
+                patch.object(
+                    recorder,
+                    "_unreal_localappdata_input_candidates",
+                    return_value=([newer, older], False),
+                ),
+                patch.object(
+                    recorder,
+                    "discover_default_input_from_game_directory",
+                    return_value=pak_result,
+                ),
+            ):
+                result = recorder.discover_unreal_keymap(game)
+
+        self.assertFalse(result.has_verified_player_config)
+        self.assertEqual(recorder.KEYMAP_AUTHORITY_DEFAULT_ONLY, result.binding_authority)
+        self.assertIn("Space", result.keymap)
+        self.assertNotIn("J", result.keymap)
+        self.assertIn(newer, result.source_files)
+        self.assertNotIn(older, result.source_files)
+
+    def test_unreal_pak_default_outranks_generic_install_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            game = Path(directory)
+            pak = game / "Demo.pak"
+            pak_discovery = KeymapDiscovery(
+                {"Space": {"type": "keyboard", "action": "Jump"}},
+                (pak,),
+                1,
+                False,
+                True,
+                notice="已读取 Pak 中的游戏默认键位。",
+                source_records=(
+                    recorder.KeymapSource(
+                        pak,
+                        "pak_default",
+                        "Demo/Config/DefaultInput.ini",
+                    ),
+                ),
+                binding_authority=recorder.KEYMAP_AUTHORITY_DEFAULT_ONLY,
+                apply_mode=recorder.KEYMAP_APPLY_REPLACE,
+            )
+            no_registry = RegistryKeymapResult(
+                {}, None, False, False, "", False
+            )
+            no_numeric_ini = NumericIniDiscoveryResult(
+                {}, False, False, ""
+            )
+            no_player_files = PlayerConfigDiscovery((), (), (), 0, False)
+
+            with (
+                patch.object(
+                    recorder,
+                    "discover_foundation_registry_keymap",
+                    return_value=no_registry,
+                ),
+                patch.object(
+                    recorder,
+                    "discover_fromsoftware_numeric_ini_keymap",
+                    return_value=no_numeric_ini,
+                ),
+                patch.object(
+                    recorder,
+                    "discover_player_config_files",
+                    return_value=no_player_files,
+                ),
+                patch.object(
+                    recorder,
+                    "discover_external_player_keymap",
+                    return_value=KeymapDiscovery({}, (), 0, False),
+                ),
+                patch.object(
+                    recorder,
+                    "discover_unreal_keymap",
+                    return_value=pak_discovery,
+                ),
+                patch.object(
+                    recorder,
+                    "discover_structured_json_keymaps",
+                    side_effect=AssertionError(
+                        "精确 Pak 默认键位应先于泛型 JSON 安装默认值"
+                    ),
+                ) as discover_json,
+                patch.object(
+                    recorder,
+                    "discover_indexed_xml_keymap",
+                    side_effect=AssertionError(
+                        "精确 Pak 默认键位应先于泛型 XML 安装默认值"
+                    ),
+                ) as discover_xml,
+                patch.object(
+                    recorder,
+                    "discover_valve_keymap",
+                    side_effect=AssertionError(
+                        "精确 Pak 默认键位应先于 Valve 安装默认值"
+                    ),
+                ) as discover_valve,
+            ):
+                result = discover_keymap_from_game_directory(game)
+
+        self.assertEqual(result, pak_discovery)
+        discover_json.assert_not_called()
+        discover_xml.assert_not_called()
+        discover_valve.assert_not_called()
+
+    def test_pak_result_preserves_all_prior_scan_counts_and_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            game = Path(directory)
+            foundation = RegistryKeymapResult(
+                {}, None, False, False, "", False,
+                scanned_executables=3,
+                truncated=True,
+            )
+            numeric = NumericIniDiscoveryResult(
+                {}, False, False, "",
+                scanned_executables=4,
+                truncated=True,
+            )
+            external = KeymapDiscovery({}, (), 5, True)
+            pak = game / "Game.pak"
+            unreal = KeymapDiscovery(
+                {"Space": {"type": "keyboard", "action": "Jump"}},
+                (pak,),
+                2,
+                False,
+                True,
+                source_records=(
+                    recorder.KeymapSource(
+                        pak,
+                        "pak_default",
+                        "Demo/Config/DefaultInput.ini",
+                    ),
+                ),
+                binding_authority=recorder.KEYMAP_AUTHORITY_DEFAULT_ONLY,
+                apply_mode=recorder.KEYMAP_APPLY_REPLACE,
+            )
+            with (
+                patch.object(
+                    recorder,
+                    "discover_foundation_registry_keymap",
+                    return_value=foundation,
+                ),
+                patch.object(
+                    recorder,
+                    "discover_fromsoftware_numeric_ini_keymap",
+                    return_value=numeric,
+                ),
+                patch.object(
+                    recorder,
+                    "discover_player_config_files",
+                    return_value=PlayerConfigDiscovery((), (), (), 0, False),
+                ),
+                patch.object(
+                    recorder,
+                    "discover_external_player_keymap",
+                    return_value=external,
+                ),
+                patch.object(
+                    recorder,
+                    "discover_unreal_keymap",
+                    return_value=unreal,
+                ),
+            ):
+                result = discover_keymap_from_game_directory(game)
+
+        self.assertEqual(14, result.scanned_files)
+        self.assertTrue(result.truncated)
+        self.assertEqual(unreal.keymap, result.keymap)
+        self.assertEqual(
+            recorder.KEYMAP_AUTHORITY_DEFAULT_ONLY,
+            result.binding_authority,
+        )
 
     def test_discovers_unity_input_actions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3764,6 +4795,25 @@ Tab
         self.assertIsNone(
             item._keyboard_mapping_key("K", {"Ctrl", "Alt", "K"}, ambiguous)
         )
+        self.assertEqual(
+            item._keyboard_mapping_key(
+                "W",
+                {"Shift", "W"},
+                {"W": {"type": "keyboard", "action": "Move"}},
+            ),
+            "W",
+        )
+        self.assertEqual(
+            item._keyboard_mapping_key(
+                "K",
+                {"Ctrl", "Alt", "K"},
+                {
+                    "K": {"type": "keyboard", "action": "Plain"},
+                    "Ctrl+K": {"type": "keyboard", "action": "Command"},
+                },
+            ),
+            "Ctrl+K",
+        )
         ambiguous["Ctrl+Alt+K"] = {
             "type": "keyboard",
             "action": "Exact action",
@@ -3838,6 +4888,14 @@ Tab
         self.assertEqual(
             [event["key_chord"] for event in actions],
             ["Shift+leftClick", "", "Ctrl+Alt+mouseWheelUp", ""],
+        )
+        self.assertEqual(
+            item._pointing_mapping_key(
+                "mouseWheelUp",
+                {"Ctrl", "Alt", "Shift"},
+                item.session.keymap,
+            ),
+            "Ctrl+Alt+mouseWheelUp",
         )
         self.assertEqual(
             [event["mouse_event"] for event in actions],
