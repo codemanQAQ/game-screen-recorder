@@ -1,0 +1,44 @@
+.venv/
+__pycache__/
+build/
+dist/
+*.spec
+*.py[cod]
+.pytest_cache/
+.coverage*
+htmlcov/
+
+# Build and runtime artifacts
+*.exe
+*.pkg
+*.pyz
+*.log
+*.tmp
+*.bak
+
+# Recordings and generated capture metadata
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.webm
+rejected/
+*_manifest.json
+*_failure.json
+*_keymap.json
+*_????-??-??_??-??-??_????????_???.json
+
+# Local credentials and signing material
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Editor and operating-system metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

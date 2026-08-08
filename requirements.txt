@@ -1,0 +1,9 @@
+dxcam==0.3.0
+mss==10.1.0
+numpy==2.3.2
+static-ffmpeg==3.0
+UnityPy==1.25.2
+dnfile==0.18.0
+dncil==1.0.2
+pypdf==6.14.2
+zstandard==0.25.0
