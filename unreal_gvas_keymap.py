@@ -897,7 +897,6 @@ def discover_gvas_player_keymap(
     started = time.monotonic()
     files, truncated = _candidate_files(candidates, active_limits)
     deadline = started + max(0.01, active_limits.timeout_seconds)
-    best: GvasPlayerKeymapResult | None = None
     scanned = 0
     for index, path in enumerate(files, start=1):
         remaining = deadline - time.monotonic()
@@ -917,18 +916,13 @@ def discover_gvas_player_keymap(
                 "truncated": truncated,
             }
         )
-        if result.has_verified_player_config:
+        # ``files`` preserves the caller's currentness ordering.  The first
+        # structurally recognized player options save is therefore
+        # authoritative even when it has no serialized KeyConfigSettings or
+        # uses a newer unsupported key-config layout.  Falling through to an
+        # older verified save would silently resurrect stale bindings.
+        if result.recognized:
             return result
-        if result.recognized and best is None:
-            best = result
-    if best is not None:
-        return GvasPlayerKeymapResult(
-            **{
-                **best.__dict__,
-                "scanned_files": scanned,
-                "truncated": truncated,
-            }
-        )
     return GvasPlayerKeymapResult(
         {}, False, False, False,
         "未在给定的玩家数据候选位置发现受支持的 GVAS 键位配置。",

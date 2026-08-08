@@ -204,6 +204,63 @@ class UnrealGvasKeymapTests(unittest.TestCase):
             result.keymap,
         )
 
+    def test_newer_recognized_without_key_config_blocks_older_verified_save(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            newer = root / "current_UserOption.sav"
+            older = root / "backup_UserOption.sav"
+            newer.write_bytes(_options_gvas(_common_settings()))
+            older.write_bytes(
+                _options_gvas(_common_settings(), _supported_key_config())
+            )
+            os.utime(older, (100, 100))
+            os.utime(newer, (200, 200))
+
+            result = discover_gvas_player_keymap([newer, older])
+
+        self.assertTrue(result.recognized)
+        self.assertTrue(result.has_player_file)
+        self.assertTrue(result.needs_key_change)
+        self.assertFalse(result.has_verified_player_config)
+        self.assertFalse(result.unsupported_schema)
+        self.assertEqual({}, result.keymap)
+        self.assertEqual(newer, result.source_file)
+        self.assertEqual(1, result.scanned_files)
+
+    def test_newer_unsupported_key_config_blocks_older_verified_save(self) -> None:
+        unsupported_key_config = _tag(
+            "KeyConfigSettings",
+            "StructProperty",
+            _stream(_tag("FutureMappings", "IntProperty", struct.pack("<i", 1))),
+            struct_name="DemoKeyConfigSettings",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            newer = root / "current_UserOption.sav"
+            older = root / "backup_UserOption.sav"
+            newer.write_bytes(
+                _options_gvas(_common_settings(), unsupported_key_config)
+            )
+            older.write_bytes(
+                _options_gvas(_common_settings(), _supported_key_config())
+            )
+            os.utime(older, (100, 100))
+            os.utime(newer, (200, 200))
+
+            result = discover_gvas_player_keymap([newer, older])
+
+        self.assertTrue(result.recognized)
+        self.assertTrue(result.has_player_file)
+        self.assertFalse(result.needs_key_change)
+        self.assertFalse(result.has_verified_player_config)
+        self.assertTrue(result.unsupported_schema)
+        self.assertTrue(result.has_key_config)
+        self.assertEqual({}, result.keymap)
+        self.assertEqual(newer, result.source_file)
+        self.assertEqual(1, result.scanned_files)
+
     def test_non_option_and_truncated_files_are_not_player_configs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -220,6 +277,32 @@ class UnrealGvasKeymapTests(unittest.TestCase):
         self.assertFalse(broken_result.recognized)
         self.assertFalse(broken_result.has_player_file)
 
+    def test_discovery_skips_nonmatching_and_corrupt_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unrelated = root / "newer_world.sav"
+            broken = root / "broken_options.sav"
+            current = root / "current_UserOption.sav"
+            unrelated.write_bytes(
+                _options_gvas(
+                    _common_settings(),
+                    save_class="/Script/Demo.WorldSaveGame",
+                )
+            )
+            broken.write_bytes(_options_gvas(_common_settings())[:-20])
+            current.write_bytes(
+                _options_gvas(_common_settings(), _supported_key_config())
+            )
+
+            result = discover_gvas_player_keymap(
+                [unrelated, broken, current]
+            )
+
+        self.assertTrue(result.recognized)
+        self.assertTrue(result.has_verified_player_config)
+        self.assertEqual(current, result.source_file)
+        self.assertEqual(3, result.scanned_files)
+
     def test_discovery_uses_fixed_unreal_location_without_recursive_scan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             local = Path(directory)
@@ -233,6 +316,7 @@ class UnrealGvasKeymapTests(unittest.TestCase):
 
         self.assertTrue(result.recognized)
         self.assertEqual(player, result.source_file)
+        # The first recognized current player file decides discovery state.
         self.assertEqual(1, result.scanned_files)
         self.assertFalse(result.truncated)
 
@@ -270,7 +354,8 @@ class UnrealGvasKeymapTests(unittest.TestCase):
         self.assertFalse(result.requires_game_launch)
         self.assertFalse(result.truncated)
         self.assertEqual((player.resolve(),), result.source_files)
-        self.assertEqual(1, result.scanned_files)
+        # One GVAS player file plus the bounded packaged-default probe.
+        self.assertEqual(2, result.scanned_files)
         self.assertIn("成功解析玩家配置文件", result.notice)
         self.assertIn("已经生成玩家设置", result.notice)
         self.assertIn("使用游戏内置默认键位", result.notice)
@@ -305,11 +390,17 @@ class UnrealGvasKeymapTests(unittest.TestCase):
             with patch.dict(os.environ, {"LOCALAPPDATA": str(local_appdata)}):
                 result = screen_recorder.discover_keymap_from_game_directory(game)
 
-        self.assertTrue(result.recognized_config)
-        self.assertTrue(result.has_verified_player_config)
-        self.assertFalse(result.has_recognized_player_file)
+        self.assertFalse(result.recognized_config)
+        self.assertFalse(result.has_verified_player_config)
+        self.assertTrue(result.has_recognized_player_file)
         self.assertEqual("Jump", result.keymap["J"]["action"])
-        self.assertEqual((player_input.resolve(),), result.source_files)
+        self.assertEqual(
+            (player.resolve(), player_input.resolve()),
+            result.source_files,
+        )
+        self.assertEqual("mixed_unverified", result.binding_authority)
+        self.assertEqual("merge", result.apply_mode)
+        self.assertIn("增量操作", result.notice)
 
     def test_verified_gvas_outranks_authoritative_install_json(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

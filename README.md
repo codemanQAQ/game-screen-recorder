@@ -30,6 +30,13 @@
      一个键位后重试，但游戏是否写出完整映射仍以其实际保存行为为准。GVAS 键位
      仅在属性类型、集合边界和
      `MainKey/SecondaryKey` 结构都能完整验证时导入，未知布局会整份拒绝；
+     工具还可只读解析 Unreal Pak v8-v11 中经过索引、条目和内容哈希完整校验的
+     `*/Config/DefaultInput.ini`。未压缩、Zlib/Gzip 与流头明确标识为 Kraken 的
+     Oodle 数据受支持；加密索引、其他 Oodle 编码、未知布局、截断扫描和无法确定
+     补丁加载顺序的结果都会整份拒绝。Kraken 解码器只在有大小、倍率和超时限制的
+     独立子进程中运行，不读取或分发游戏自带的 Epic/RAD Oodle DLL。Pak 中读取的
+     内容始终标记为“游戏安装默认键位”，不会冒充玩家实际改键；若动作标识仍为英文，
+     必须对照游戏内设置逐项改成中文并完成人工核对；
      Unity Input System 的 `.inputactions`、
      Addressables/序列化 InputActionAsset，以及文本或二进制 `InputManager`；
      Godot 3/4 的文本 InputMap 与官方 Windows `user://` 目录；.NET/MonoGame/XNA
@@ -74,7 +81,8 @@
    只有在可执行文件的动作编号关系与完整格式指纹均通过校验时，工具才会载入该格式
    的默认键位并明确提示；启动游戏、改键并正常退出后再次扫描，即可读取实际设置。
 
-   无法通用解析的其他专有二进制 SaveGame、加密/压缩资源包、Godot PCK 内二进制
+   无法通用解析的其他专有二进制 SaveGame、加密 Unreal Pak、非 Kraken Oodle、
+   不支持的专有压缩资源包、Godot PCK 内二进制
    InputMap 或完全自定义运行时按键逻辑仍需手动校正或导入 Keymap；工具不会为了
    “猜中”而执行游戏文件或把普通画质/音频配置当成键位表。
    如果没有找到实际玩家配置，工具还会递归查找安装目录自带的 PDF 游戏手册，
