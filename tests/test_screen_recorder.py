@@ -11,7 +11,7 @@ import zipfile
 import zlib
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import zstandard
@@ -488,6 +488,73 @@ def _write_steam_manifest(
 
 
 class RecorderLogicTests(unittest.TestCase):
+    def test_mapping_capture_normalizes_keys_and_modifier_order(self) -> None:
+        self.assertEqual("A", recorder._captured_tk_key_name("a", 0x41))
+        self.assertEqual(
+            "NumPad1",
+            recorder._captured_tk_key_name("KP_1", 0x61),
+        )
+        self.assertEqual(
+            "Ctrl",
+            recorder._captured_tk_key_name("Control_L", 0x11),
+        )
+        self.assertEqual(
+            "NumPadEnter",
+            recorder._captured_tk_key_name("KP_Enter", 0x0D),
+        )
+        self.assertEqual(
+            "'",
+            recorder._captured_tk_key_name("apostrophe", 0xDE),
+        )
+        self.assertEqual(
+            "Ctrl+Alt+Shift+E",
+            recorder._compose_captured_input(
+                "E",
+                {"Shift", "Ctrl", "Alt"},
+            ),
+        )
+        self.assertEqual(
+            "Shift+leftClick",
+            recorder._compose_captured_input("leftClick", {"Shift"}),
+        )
+
+    def test_add_mapping_opens_capture_dialog_and_stores_result(self) -> None:
+        owner = recorder.SessionConfigDialog.__new__(
+            recorder.SessionConfigDialog
+        )
+        captured = recorder.CapturedMapping("F1", "keyboard", "打开帮助")
+        owner._store_captured_mapping = MagicMock()
+        child = MagicMock(result=captured)
+
+        with patch.object(
+            recorder,
+            "MappingCaptureDialog",
+            return_value=child,
+        ) as capture_dialog:
+            owner._open_add_mapping()
+
+        capture_dialog.assert_called_once_with(owner)
+        owner._store_captured_mapping.assert_called_once_with(captured)
+
+    def test_store_captured_mapping_does_not_silently_overwrite(self) -> None:
+        owner = recorder.SessionConfigDialog.__new__(
+            recorder.SessionConfigDialog
+        )
+        owner.keymap_tree = MagicMock()
+        owner.keymap_tree.exists.return_value = True
+        captured = recorder.CapturedMapping("F1", "keyboard", "打开帮助")
+
+        with patch.object(
+            recorder.messagebox,
+            "askyesno",
+            return_value=False,
+        ) as confirm:
+            owner._store_captured_mapping(captured)
+
+        confirm.assert_called_once()
+        owner.keymap_tree.item.assert_not_called()
+        owner.keymap_tree.insert.assert_not_called()
+
     def test_encoder_queue_capacity_is_bounded_by_frames_and_memory(self) -> None:
         self.assertEqual(encoder_queue_capacity(1920, 1080), 8)
         self.assertEqual(encoder_queue_capacity(2560, 1440), 8)

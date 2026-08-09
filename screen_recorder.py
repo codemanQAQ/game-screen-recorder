@@ -70,7 +70,7 @@ import zstandard
 
 
 APP_NAME = "悬浮录屏"
-APP_VERSION = "2.21.1"
+APP_VERSION = "2.22.0"
 SCHEMA_VERSION = "2.1"
 FPS = 30.0
 BUTTON_SIZE = 84
@@ -422,6 +422,13 @@ class RecordingResult:
 class SessionConfig:
     game_title: str
     keymap: dict[str, dict[str, str]]
+
+
+@dataclass(frozen=True)
+class CapturedMapping:
+    input_name: str
+    device_type: str
+    action: str
 
 
 def _contains_latin_letter(text: str) -> bool:
@@ -7762,6 +7769,7 @@ class InputEventTracker:
         0xDB: "[",
         0xDC: "\\",
         0xDD: "]",
+        0xDE: "'",
     }
 
     def __init__(
@@ -11010,14 +11018,304 @@ def select_capture_target(root: Tk) -> CaptureTarget | None:
     return target
 
 
+_CAPTURE_MODIFIER_ORDER = ("Ctrl", "Alt", "Shift", "Win")
+_CAPTURE_MOUSE_BUTTONS = {
+    1: "leftClick",
+    2: "middleClick",
+    3: "rightClick",
+    4: "mouseButton4",
+    5: "mouseButton5",
+}
+
+
+def _captured_tk_key_name(keysym: str, keycode: int) -> str | None:
+    """Convert one Tk key event to the recorder's canonical input name."""
+
+    tkinter_aliases = {
+        "shift_l": "Shift",
+        "shift_r": "Shift",
+        "control_l": "Ctrl",
+        "control_r": "Ctrl",
+        "alt_l": "Alt",
+        "alt_r": "Alt",
+        "meta_l": "Win",
+        "meta_r": "Win",
+        "super_l": "Win",
+        "super_r": "Win",
+        "kp_enter": "NumPadEnter",
+        "kp_add": "NumPadAdd",
+        "kp_subtract": "NumPadSubtract",
+        "kp_multiply": "NumPadMultiply",
+        "kp_divide": "NumPadDivide",
+        "kp_decimal": "NumPadDecimal",
+        "equal": "=",
+        "bracketleft": "[",
+        "bracketright": "]",
+        "backslash": "\\",
+        "grave": "Tilde",
+        "quoteleft": "Tilde",
+        "apostrophe": "'",
+        "quoteright": "'",
+    }
+    folded = keysym.casefold()
+    if folded in tkinter_aliases:
+        return tkinter_aliases[folded]
+    numpad = re.fullmatch(r"kp_([0-9])", folded)
+    if numpad:
+        return f"NumPad{numpad.group(1)}"
+    if sys.platform == "win32" and 0 < keycode <= 0xFF:
+        captured = InputEventTracker._key_name(keycode, 0, 0)
+        if captured and not captured.startswith("VK_"):
+            return captured
+    canonical = _canonical_input_name(keysym)
+    if canonical is not None and canonical[1] == "keyboard":
+        return canonical[0]
+    return None
+
+
+def _compose_captured_input(
+    base_input: str,
+    modifiers: set[str] | frozenset[str],
+) -> str:
+    if base_input in _CAPTURE_MODIFIER_ORDER:
+        return base_input
+    ordered = [
+        modifier
+        for modifier in _CAPTURE_MODIFIER_ORDER
+        if modifier in modifiers
+    ]
+    return "+".join([*ordered, base_input])
+
+
+class MappingCaptureDialog(simpledialog.Dialog):
+    """Capture a physical key/button and a manually entered action semantic."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        *,
+        initial_input: str = "",
+        initial_device: str = "keyboard",
+        initial_action: str = "",
+        title: str = "新增键位映射",
+    ) -> None:
+        self.initial_input = initial_input
+        self.initial_device = initial_device
+        self.initial_action = initial_action
+        self.captured_input = initial_input
+        self.captured_device = initial_device
+        self.result: CapturedMapping | None = None
+        self._capture_active = False
+        self._pressed_modifiers: set[str] = set()
+        self.capture_var: tk.StringVar
+        self.action_entry: tk.Entry
+        self.capture_entry: tk.Entry
+        super().__init__(parent, title=title)
+
+    def body(self, master: tk.Frame) -> tk.Widget:
+        tk.Label(master, text="按键").grid(
+            row=0,
+            column=0,
+            sticky="w",
+            padx=(10, 6),
+            pady=(10, 4),
+        )
+        tk.Label(master, text="动作语义").grid(
+            row=0,
+            column=1,
+            sticky="w",
+            padx=(6, 10),
+            pady=(10, 4),
+        )
+        self.capture_var = tk.StringVar(
+            master=master,
+            value=self.initial_input or "点击此框后按下按键",
+        )
+        self.capture_entry = tk.Entry(
+            master,
+            textvariable=self.capture_var,
+            width=28,
+            state="readonly",
+            readonlybackground="white",
+            cursor="hand2",
+            justify="center",
+        )
+        self.capture_entry.grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            padx=(10, 6),
+            pady=(0, 4),
+        )
+        self.action_entry = tk.Entry(master, width=36)
+        self.action_entry.insert(0, self.initial_action)
+        self.action_entry.grid(
+            row=1,
+            column=1,
+            sticky="ew",
+            padx=(6, 10),
+            pady=(0, 4),
+        )
+        tk.Label(
+            master,
+            text=(
+                "点击左框进入捕获状态；可按键盘键、组合键，或再次点击/滚动鼠标。"
+                "右框请填写当前游戏中的中文动作语义。"
+            ),
+            foreground="#6B7280",
+            justify="left",
+            wraplength=560,
+        ).grid(
+            row=2,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            padx=10,
+            pady=(2, 10),
+        )
+        master.grid_columnconfigure(0, weight=1)
+        master.grid_columnconfigure(1, weight=1)
+        self.capture_entry.bind("<ButtonPress>", self._capture_mouse_button)
+        self.capture_entry.bind("<MouseWheel>", self._capture_mouse_wheel)
+        self.capture_entry.bind("<KeyPress>", self._capture_key_press)
+        self.capture_entry.bind("<KeyRelease>", self._capture_key_release)
+        return self.action_entry
+
+    def buttonbox(self) -> None:
+        box = tk.Frame(self)
+        tk.Button(
+            box,
+            text="确定",
+            width=12,
+            command=self.ok,
+            default=tk.ACTIVE,
+        ).pack(side=tk.LEFT, padx=5, pady=(4, 10))
+        tk.Button(
+            box,
+            text="取消",
+            width=12,
+            command=self.cancel,
+        ).pack(side=tk.LEFT, padx=5, pady=(4, 10))
+        self.bind("<Return>", self.ok)
+        self.bind("<Escape>", self.cancel)
+        box.pack()
+
+    def _begin_capture(self) -> None:
+        self._capture_active = True
+        self._pressed_modifiers.clear()
+        self.capture_var.set("请按下按键…")
+        self.capture_entry.focus_set()
+
+    def _finish_capture(self, input_name: str, device_type: str) -> None:
+        self.captured_input = input_name
+        self.captured_device = device_type
+        self._capture_active = False
+        self._pressed_modifiers.clear()
+        self.capture_var.set(input_name)
+        self.action_entry.focus_set()
+
+    def _capture_key_press(self, event: tk.Event) -> str:
+        if not self._capture_active:
+            self._begin_capture()
+        key_name = _captured_tk_key_name(
+            str(getattr(event, "keysym", "")),
+            int(getattr(event, "keycode", 0) or 0),
+        )
+        if key_name is None:
+            self.bell()
+            return "break"
+        if key_name in _CAPTURE_MODIFIER_ORDER:
+            self._pressed_modifiers.add(key_name)
+            ordered = [
+                modifier
+                for modifier in _CAPTURE_MODIFIER_ORDER
+                if modifier in self._pressed_modifiers
+            ]
+            self.capture_var.set("+".join([*ordered, "…"]))
+            return "break"
+        self._finish_capture(
+            _compose_captured_input(key_name, self._pressed_modifiers),
+            "keyboard",
+        )
+        return "break"
+
+    def _capture_key_release(self, event: tk.Event) -> str:
+        if not self._capture_active:
+            return "break"
+        key_name = _captured_tk_key_name(
+            str(getattr(event, "keysym", "")),
+            int(getattr(event, "keycode", 0) or 0),
+        )
+        if (
+            key_name in _CAPTURE_MODIFIER_ORDER
+            and self._pressed_modifiers == {key_name}
+        ):
+            self._finish_capture(key_name, "keyboard")
+        elif key_name in _CAPTURE_MODIFIER_ORDER:
+            self._pressed_modifiers.discard(key_name)
+        return "break"
+
+    def _capture_mouse_button(self, event: tk.Event) -> str:
+        if not self._capture_active:
+            self._begin_capture()
+            return "break"
+        button = _CAPTURE_MOUSE_BUTTONS.get(
+            int(getattr(event, "num", 0) or 0)
+        )
+        if button is None:
+            self.bell()
+            return "break"
+        self._finish_capture(
+            _compose_captured_input(button, self._pressed_modifiers),
+            "mouse",
+        )
+        return "break"
+
+    def _capture_mouse_wheel(self, event: tk.Event) -> str:
+        if not self._capture_active:
+            self._begin_capture()
+            return "break"
+        delta = int(getattr(event, "delta", 0) or 0)
+        if delta == 0:
+            return "break"
+        button = "mouseWheelUp" if delta > 0 else "mouseWheelDown"
+        self._finish_capture(
+            _compose_captured_input(button, self._pressed_modifiers),
+            "mouse",
+        )
+        return "break"
+
+    def validate(self) -> bool:
+        action = self.action_entry.get().strip()
+        if not self.captured_input:
+            messagebox.showerror(
+                "尚未记录按键",
+                "请点击左侧按键框，然后按下需要记录的按键。",
+                parent=self,
+            )
+            return False
+        if not action:
+            messagebox.showerror(
+                "动作语义为空",
+                "请在右侧输入该按键对应的中文动作语义。",
+                parent=self,
+            )
+            return False
+        self.result = CapturedMapping(
+            self.captured_input,
+            self.captured_device,
+            action,
+        )
+        return True
+
+    def apply(self) -> None:
+        return
+
+
 class SessionConfigDialog(simpledialog.Dialog):
     def __init__(self, parent: Tk) -> None:
         self.game_title_entry: tk.Entry
         self.keymap_tree: ttk.Treeview
-        self.input_entry: tk.Entry
-        self.type_combo: ttk.Combobox
-        self.movement_combo: ttk.Combobox
-        self.action_entry: tk.Entry
         self.result: SessionConfig | None = None
         self._keymap_needs_manual_confirmation = False
         super().__init__(parent, title="设置游戏信息与按键映射")
@@ -11082,45 +11380,33 @@ class SessionConfigDialog(simpledialog.Dialog):
         self.keymap_tree.configure(yscrollcommand=scrollbar.set)
         self.keymap_tree.pack(side=tk.LEFT, fill="both", expand=True)
         scrollbar.pack(side=tk.RIGHT, fill="y")
-        self.keymap_tree.bind("<<TreeviewSelect>>", self._select_mapping)
+        self.keymap_tree.bind("<Double-Button-1>", self._edit_selected_mapping)
 
         editor = tk.Frame(master)
         editor.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 5))
-        tk.Label(editor, text="输入").grid(row=0, column=0, sticky="w")
-        self.input_entry = tk.Entry(editor, width=17)
-        self.input_entry.grid(row=1, column=0, padx=(0, 5))
-        tk.Label(editor, text="设备").grid(row=0, column=1, sticky="w")
-        self.type_combo = ttk.Combobox(
-            editor,
-            values=("keyboard", "mouse", "gamepad"),
-            state="readonly",
-            width=11,
-        )
-        self.type_combo.set("keyboard")
-        self.type_combo.grid(row=1, column=1, padx=(0, 5))
-        tk.Label(editor, text="移动方向").grid(row=0, column=2, sticky="w")
-        self.movement_combo = ttk.Combobox(
-            editor,
-            values=("", "W", "B", "L", "R"),
-            state="readonly",
-            width=9,
-        )
-        self.movement_combo.set("")
-        self.movement_combo.grid(row=1, column=2, padx=(0, 5))
-        tk.Label(editor, text="动作语义").grid(row=0, column=3, sticky="w")
-        self.action_entry = tk.Entry(editor, width=34)
-        self.action_entry.grid(row=1, column=3, padx=(0, 5), sticky="ew")
-        editor.grid_columnconfigure(3, weight=1)
         tk.Button(
             editor,
-            text="添加/更新",
-            command=self._upsert_mapping,
-        ).grid(row=1, column=4, padx=(0, 5))
+            text="新增键位",
+            width=12,
+            command=self._open_add_mapping,
+        ).pack(side=tk.LEFT, padx=(0, 5))
+        tk.Button(
+            editor,
+            text="编辑所选",
+            width=12,
+            command=self._edit_selected_mapping,
+        ).pack(side=tk.LEFT, padx=(0, 5))
         tk.Button(
             editor,
             text="删除",
+            width=10,
             command=self._delete_mapping,
-        ).grid(row=1, column=5)
+        ).pack(side=tk.LEFT)
+        tk.Label(
+            editor,
+            text="提示：双击表格中的键位也可编辑。",
+            foreground="#6B7280",
+        ).pack(side=tk.LEFT, padx=(12, 0))
         self._set_keymap(DEFAULT_KEYMAP)
         master.grid_columnconfigure(0, weight=1)
         master.grid_rowconfigure(4, weight=1)
@@ -11473,21 +11759,35 @@ class SessionConfigDialog(simpledialog.Dialog):
             raise ValueError("Keymap不能为空")
         return document
 
-    def _upsert_mapping(self) -> None:
-        key = self.input_entry.get().strip()
-        device_type = self.type_combo.get()
-        movement = self.movement_combo.get()
-        action = self.action_entry.get().strip()
-        if device_type == "keyboard" and len(key) == 1:
-            key = key.upper()
-        if not key or not action:
-            messagebox.showerror(
-                "映射不完整",
-                "输入名称和动作语义不能为空。",
+    def _open_add_mapping(self) -> None:
+        dialog = MappingCaptureDialog(self)
+        if dialog.result is not None:
+            self._store_captured_mapping(dialog.result)
+
+    def _store_captured_mapping(
+        self,
+        captured: CapturedMapping,
+        *,
+        previous_input: str = "",
+        movement: str = "",
+    ) -> None:
+        key = captured.input_name
+        if self.keymap_tree.exists(key) and key != previous_input:
+            overwrite = messagebox.askyesno(
+                "按键已经存在",
+                f"按键 {key} 已存在映射，是否覆盖原有动作语义？",
+                icon=messagebox.WARNING,
+                default=messagebox.NO,
                 parent=self,
             )
-            return
-        values = (key, device_type, movement, action)
+            if not overwrite:
+                return
+        values = (key, captured.device_type, movement, captured.action)
+        if previous_input and previous_input != key:
+            if self.keymap_tree.exists(key):
+                self.keymap_tree.delete(key)
+            if self.keymap_tree.exists(previous_input):
+                self.keymap_tree.delete(previous_input)
         if self.keymap_tree.exists(key):
             self.keymap_tree.item(key, values=values)
         else:
@@ -11497,20 +11797,33 @@ class SessionConfigDialog(simpledialog.Dialog):
         for item in self.keymap_tree.selection():
             self.keymap_tree.delete(item)
 
-    def _select_mapping(self, _event: tk.Event) -> None:
+    def _edit_selected_mapping(self, _event: tk.Event | None = None) -> None:
         selected = self.keymap_tree.selection()
         if not selected:
+            if _event is None:
+                messagebox.showinfo(
+                    "尚未选择键位",
+                    "请先在表格中选择需要编辑的键位。",
+                    parent=self,
+                )
             return
         key, device_type, movement, action = self.keymap_tree.item(
             selected[0],
             "values",
         )
-        self.input_entry.delete(0, "end")
-        self.input_entry.insert(0, key)
-        self.type_combo.set(device_type)
-        self.movement_combo.set(movement)
-        self.action_entry.delete(0, "end")
-        self.action_entry.insert(0, action)
+        dialog = MappingCaptureDialog(
+            self,
+            initial_input=str(key),
+            initial_device=str(device_type),
+            initial_action=str(action),
+            title="编辑键位映射",
+        )
+        if dialog.result is not None:
+            self._store_captured_mapping(
+                dialog.result,
+                previous_input=str(key),
+                movement=str(movement),
+            )
 
     def _focus_mapping(self, input_name: str) -> None:
         if not self.keymap_tree.exists(input_name):
