@@ -119,6 +119,58 @@ def _supported_key_config() -> bytes:
     )
 
 
+def _axis_entry(action: str, filter_member: str, key: str) -> bytes:
+    return _stream(
+        _tag("AxisName", "NameProperty", _fstring(action)),
+        _tag(
+            "FilterType",
+            "EnumProperty",
+            _fstring(f"DemoAxisFilterType::{filter_member}"),
+            enum_name="DemoAxisFilterType",
+        ),
+        _tag(
+            "MainKey",
+            "StructProperty",
+            _fstring(key),
+            struct_name="Key",
+        ),
+        _tag(
+            "SecondaryKey",
+            "StructProperty",
+            _fstring("None"),
+            struct_name="Key",
+        ),
+    )
+
+
+def _supported_axis_key_config(*, invalid_filter: str = "") -> bytes:
+    filter_value = invalid_filter or "Plus"
+    entries = (
+        _axis_entry("MoveForward", filter_value, "W")
+        + _axis_entry("MoveForward", "Minus", "S")
+        + _axis_entry("MoveRight", "Minus", "A")
+        + _axis_entry("MoveRight", "Plus", "D")
+    )
+    inner = _tag(
+        "MouseAndKeyboardAxisMappings",
+        "StructProperty",
+        entries,
+        struct_name="DemoAxisKeyConfigKeys",
+    )
+    axis_array = _tag(
+        "MouseAndKeyboardAxisMappings",
+        "ArrayProperty",
+        struct.pack("<I", 4) + inner,
+        inner_type="StructProperty",
+    )
+    return _tag(
+        "KeyConfigSettings",
+        "StructProperty",
+        _stream(axis_array),
+        struct_name="DemoKeyConfigSettings",
+    )
+
+
 class UnrealGvasKeymapTests(unittest.TestCase):
     def test_common_unreal_fkey_names_are_canonicalized(self) -> None:
         expected = {
@@ -203,6 +255,49 @@ class UnrealGvasKeymapTests(unittest.TestCase):
             },
             result.keymap,
         )
+
+    def test_axis_filter_type_is_validated_and_preserves_movement_direction(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "UserOption.sav"
+            path.write_bytes(
+                _options_gvas(
+                    _common_settings(),
+                    _supported_axis_key_config(),
+                )
+            )
+
+            result = parse_gvas_player_keymap(path)
+
+        self.assertTrue(result.has_verified_player_config)
+        self.assertFalse(result.unsupported_schema)
+        self.assertEqual("W", result.keymap["W"]["movement_direction"])
+        self.assertEqual("B", result.keymap["S"]["movement_direction"])
+        self.assertEqual("L", result.keymap["A"]["movement_direction"])
+        self.assertEqual("R", result.keymap["D"]["movement_direction"])
+
+    def test_unknown_axis_filter_type_skips_only_affected_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "UserOption.sav"
+            path.write_bytes(
+                _options_gvas(
+                    _common_settings(),
+                    _supported_axis_key_config(invalid_filter="Future"),
+                )
+            )
+
+            result = parse_gvas_player_keymap(path)
+
+        self.assertTrue(result.recognized)
+        self.assertFalse(result.unsupported_schema)
+        self.assertTrue(result.has_verified_player_config)
+        self.assertNotIn("W", result.keymap)
+        self.assertEqual("B", result.keymap["S"]["movement_direction"])
+        self.assertEqual("L", result.keymap["A"]["movement_direction"])
+        self.assertEqual("R", result.keymap["D"]["movement_direction"])
+        self.assertEqual(1, result.skipped_mappings)
+        self.assertIn("1 项无法确认并已跳过", result.diagnostic)
 
     def test_newer_recognized_without_key_config_blocks_older_verified_save(
         self,

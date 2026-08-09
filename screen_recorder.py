@@ -70,7 +70,7 @@ import zstandard
 
 
 APP_NAME = "悬浮录屏"
-APP_VERSION = "2.21.0"
+APP_VERSION = "2.21.1"
 SCHEMA_VERSION = "2.1"
 FPS = 30.0
 BUTTON_SIZE = 84
@@ -4634,6 +4634,12 @@ def discover_unreal_keymap(game_directory: Path) -> KeymapDiscovery:
                     input_name,
                     action,
                 )
+            direction = mapping.get("movement_direction")
+            if (
+                direction in {"W", "B", "L", "R"}
+                and input_name in verified_gvas_keymap
+            ):
+                verified_gvas_keymap[input_name]["movement_direction"] = direction
         return KeymapDiscovery(
             verified_gvas_keymap,
             (gvas_result.source_file,) if gvas_result.source_file else (),

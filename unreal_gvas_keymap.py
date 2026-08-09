@@ -55,6 +55,7 @@ class GvasPlayerKeymapResult:
     scanned_files: int = 0
     truncated: bool = False
     has_key_config: bool = False
+    skipped_mappings: int = 0
 
     @property
     def recognized_config(self) -> bool:
@@ -515,6 +516,33 @@ def _action_from_scalar(tag: _Tag, budget: _Budget) -> str:
     return _validate_action(_one_fstring(tag.payload, budget, tag.name))
 
 
+def _axis_filter_scale(tag: _Tag, budget: _Budget) -> float:
+    """Return the signed axis scale encoded by a tagged filter enum.
+
+    Pal-style key configuration saves store the positive and negative halves
+    of a digital movement axis as separate entries.  The enum is part of the
+    serialized schema, so validate both its declared type and qualified value
+    instead of accepting an arbitrary extra field.
+    """
+
+    if tag.type_name != "EnumProperty":
+        raise _UnsupportedSchema("FilterType 不是枚举属性")
+    enum_tail = _class_tail(tag.enum_name).casefold()
+    if not enum_tail.endswith("axisfiltertype"):
+        raise _UnsupportedSchema("FilterType 的枚举类型不受支持")
+    raw_value = _one_fstring(tag.payload, budget, tag.name)
+    if "::" not in raw_value:
+        raise _UnsupportedSchema("FilterType 缺少限定枚举名称")
+    value_type, member = raw_value.rsplit("::", 1)
+    if _class_tail(value_type).casefold() != enum_tail:
+        raise _UnsupportedSchema("FilterType 的声明类型与枚举值不一致")
+    if member.casefold() == "plus":
+        return 1.0
+    if member.casefold() == "minus":
+        return -1.0
+    raise _UnsupportedSchema(f"FilterType 枚举值不受支持：{raw_value}")
+
+
 def _binding_struct(
     tags: list[_Tag],
     budget: _Budget,
@@ -522,8 +550,10 @@ def _binding_struct(
     fallback_action: str | None,
     require_axis_name: bool,
     depth: int,
-) -> tuple[str, list[tuple[str, str]]]:
+) -> tuple[str, list[tuple[str, str]], float | None]:
     allowed = {"mainkey", "secondarykey", "axisname", "actionname", "name"}
+    if require_axis_name:
+        allowed.add("filtertype")
     if any(tag.name.casefold() not in allowed for tag in tags):
         unknown = next(tag.name for tag in tags if tag.name.casefold() not in allowed)
         raise _UnsupportedSchema(f"键位结构含未知字段：{unknown}")
@@ -552,7 +582,12 @@ def _binding_struct(
             parsed_key = _key_from_tag(by_name[name], budget, depth=depth + 1)
             if parsed_key is not None and parsed_key not in keys:
                 keys.append(parsed_key)
-    return action, keys
+    scale = (
+        _axis_filter_scale(by_name["filtertype"], budget)
+        if "filtertype" in by_name
+        else None
+    )
+    return action, keys, scale
 
 
 def _read_map_key(reader: _Reader, key_type: str) -> str:
@@ -569,7 +604,8 @@ def _parse_map_bindings(
     budget: _Budget,
     *,
     depth: int,
-) -> list[tuple[str, tuple[str, str]]]:
+    skipped: list[str],
+) -> list[tuple[str, tuple[str, str], float | None]]:
     if tag.type_name != "MapProperty" or tag.value_type != "StructProperty":
         raise _UnsupportedSchema(f"{tag.name} 不是受支持的动作到键位结构映射")
     reader = _Reader(tag.payload, budget, label=tag.name)
@@ -579,18 +615,32 @@ def _parse_map_bindings(
     count = reader.u32()
     if count > budget.limits.max_mappings:
         raise _ParseError("键位映射数量超过安全上限")
-    output: list[tuple[str, tuple[str, str]]] = []
-    for _ in range(count):
-        action = _read_map_key(reader, tag.key_type)
+    output: list[tuple[str, tuple[str, str], float | None]] = []
+    for index in range(count):
+        action = ""
+        action_error: _UnsupportedSchema | None = None
+        try:
+            action = _read_map_key(reader, tag.key_type)
+        except _UnsupportedSchema as exc:
+            action_error = exc
         value_tags = _read_tag_stream(reader, depth=depth + 1)
-        parsed_action, keys = _binding_struct(
-            value_tags,
-            budget,
-            fallback_action=action,
-            require_axis_name=False,
-            depth=depth + 1,
-        )
-        output.extend((parsed_action, key) for key in keys)
+        if action_error is not None:
+            skipped.append(f"{tag.name}[{index}]：{action_error}")
+            continue
+        try:
+            parsed_action, keys, scale = _binding_struct(
+                value_tags,
+                budget,
+                fallback_action=action,
+                require_axis_name=False,
+                depth=depth + 1,
+            )
+            if scale is not None:
+                raise _UnsupportedSchema("动作映射不能包含轴向 FilterType")
+        except _UnsupportedSchema as exc:
+            skipped.append(f"{tag.name}[{index}]：{exc}")
+            continue
+        output.extend((parsed_action, key, None) for key in keys)
     if reader.remaining:
         raise _UnsupportedSchema(f"{tag.name} 映射末尾存在未解析数据")
     return output
@@ -601,7 +651,8 @@ def _parse_axis_bindings(
     budget: _Budget,
     *,
     depth: int,
-) -> list[tuple[str, tuple[str, str]]]:
+    skipped: list[str],
+) -> list[tuple[str, tuple[str, str], float | None]]:
     if tag.type_name != "ArrayProperty" or tag.inner_type != "StructProperty":
         raise _UnsupportedSchema(f"{tag.name} 不是受支持的结构数组")
     reader = _Reader(tag.payload, budget, label=tag.name)
@@ -618,46 +669,78 @@ def _parse_axis_bindings(
     if reader.remaining:
         raise _UnsupportedSchema(f"{tag.name} 数组元素标签之后含额外数据")
     values = _Reader(inner_tag.payload, budget, label=f"{tag.name} 元素")
-    output: list[tuple[str, tuple[str, str]]] = []
-    for _ in range(count):
+    output: list[tuple[str, tuple[str, str], float | None]] = []
+    for index in range(count):
         value_tags = _read_tag_stream(values, depth=depth + 1)
-        action, keys = _binding_struct(
-            value_tags,
-            budget,
-            fallback_action=None,
-            require_axis_name=True,
-            depth=depth + 1,
-        )
-        output.extend((action, key) for key in keys)
+        try:
+            action, keys, scale = _binding_struct(
+                value_tags,
+                budget,
+                fallback_action=None,
+                require_axis_name=True,
+                depth=depth + 1,
+            )
+        except _UnsupportedSchema as exc:
+            skipped.append(f"{tag.name}[{index}]：{exc}")
+            continue
+        output.extend((action, key, scale) for key in keys)
     if values.remaining:
         raise _UnsupportedSchema(f"{tag.name} 数组末尾存在未解析数据")
     return output
 
 
-def _build_keymap(bindings: list[tuple[str, tuple[str, str]]]) -> Keymap:
-    grouped: dict[str, tuple[str, set[str]]] = {}
-    for action, (input_name, device) in bindings:
+def _axis_movement_direction(action: str, scale: float | None) -> str:
+    if scale is None:
+        return ""
+    normalized = re.sub(r"[^a-z0-9]+", "", action.casefold())
+    if normalized in {"moveforward", "forward", "vertical"}:
+        return "W" if scale > 0 else "B"
+    if normalized in {"moveright", "strafe", "horizontal"}:
+        return "R" if scale > 0 else "L"
+    return ""
+
+
+def _build_keymap(
+    bindings: list[tuple[str, tuple[str, str], float | None]],
+) -> Keymap:
+    grouped: dict[str, tuple[str, set[str], set[str]]] = {}
+    for action, (input_name, device), scale in bindings:
+        direction = _axis_movement_direction(action, scale)
         current = grouped.get(input_name)
         if current is None:
-            grouped[input_name] = (device, {action})
+            grouped[input_name] = (
+                device,
+                {action},
+                {direction} if direction else set(),
+            )
         else:
-            current_device, actions = current
+            current_device, actions, directions = current
             if current_device != device:
                 raise _UnsupportedSchema(f"输入 {input_name} 的设备类型冲突")
             actions.add(action)
+            if direction:
+                directions.add(direction)
+                if len(directions) > 1:
+                    raise _UnsupportedSchema(f"输入 {input_name} 的移动方向冲突")
     return {
         input_name: {
             "type": device,
             "action": "；".join(sorted(actions, key=str.casefold)),
-            "movement_direction": "",
+            "movement_direction": next(iter(directions), ""),
         }
-        for input_name, (device, actions) in sorted(
+        for input_name, (device, actions, directions) in sorted(
             grouped.items(), key=lambda item: item[0].casefold()
         )
     }
 
 
-def _parse_key_config(tag: _Tag, budget: _Budget, *, depth: int) -> Keymap:
+def _parse_key_config(
+    tag: _Tag,
+    budget: _Budget,
+    *,
+    depth: int,
+    skipped: list[str],
+) -> Keymap:
     if tag.type_name != "StructProperty" or not _class_tail(tag.struct_name).casefold().endswith(
         "keyconfigsettings"
     ):
@@ -674,7 +757,7 @@ def _parse_key_config(tag: _Tag, budget: _Budget, *, depth: int) -> Keymap:
         "gamepaduiinputmappings",
     }
     seen: set[str] = set()
-    bindings: list[tuple[str, tuple[str, str]]] = []
+    bindings: list[tuple[str, tuple[str, str], float | None]] = []
     for field in fields:
         name = field.name.casefold()
         if name in seen:
@@ -685,11 +768,26 @@ def _parse_key_config(tag: _Tag, budget: _Budget, *, depth: int) -> Keymap:
             # is still validated by the outer tagged-property parser.
             continue
         if name not in mouse_names:
-            raise _UnsupportedSchema(f"KeyConfigSettings 含未知字段：{field.name}")
+            skipped.append(f"KeyConfigSettings 字段：{field.name}")
+            continue
         if name == "mouseandkeyboardaxismappings":
-            bindings.extend(_parse_axis_bindings(field, budget, depth=depth + 1))
+            bindings.extend(
+                _parse_axis_bindings(
+                    field,
+                    budget,
+                    depth=depth + 1,
+                    skipped=skipped,
+                )
+            )
         else:
-            bindings.extend(_parse_map_bindings(field, budget, depth=depth + 1))
+            bindings.extend(
+                _parse_map_bindings(
+                    field,
+                    budget,
+                    depth=depth + 1,
+                    skipped=skipped,
+                )
+            )
     if not seen.intersection(mouse_names):
         raise _UnsupportedSchema("KeyConfigSettings 中没有鼠标键盘映射字段")
     if len(bindings) > budget.limits.max_mappings * 2:
@@ -772,28 +870,49 @@ def parse_gvas_player_keymap(
             )
         if len(key_fields) != 1:
             raise _UnsupportedSchema("发现多个 KeyConfigSettings，无法唯一确认")
-        keymap = _parse_key_config(key_fields[0], budget, depth=2)
+        skipped_mappings: list[str] = []
+        keymap = _parse_key_config(
+            key_fields[0],
+            budget,
+            depth=2,
+            skipped=skipped_mappings,
+        )
         if not keymap:
+            skipped_notice = (
+                f"；另有 {len(skipped_mappings)} 项无法确认并已跳过"
+                if skipped_mappings
+                else ""
+            )
             return GvasPlayerKeymapResult(
                 {}, True, True, True,
                 "已解析 KeyConfigSettings，但其中没有可用的鼠标键盘键位；"
                 "本次没有生成映射。可以尝试在游戏内改动并保存键位后重试，"
-                "或导入并人工核对 Keymap。",
+                f"或导入并人工核对 Keymap{skipped_notice}。",
                 selected,
                 gvas_class=header.save_class,
                 has_key_config=True,
+                skipped_mappings=len(skipped_mappings),
             )
+        skipped_notice = (
+            f"；另有 {len(skipped_mappings)} 项无法确认并已跳过"
+            if skipped_mappings
+            else ""
+        )
         return GvasPlayerKeymapResult(
             keymap=keymap,
             recognized=True,
             has_player_file=True,
             needs_key_change=False,
-            diagnostic=f"已从玩家 GVAS 配置解析 {len(keymap)} 个鼠标键盘输入。",
+            diagnostic=(
+                f"已从玩家 GVAS 配置解析 {len(keymap)} 个鼠标键盘输入"
+                f"{skipped_notice}。"
+            ),
             source_file=selected,
             has_verified_player_config=True,
             gvas_class=header.save_class,
             mapping_count=len(keymap),
             has_key_config=True,
+            skipped_mappings=len(skipped_mappings),
         )
     except FileNotFoundError:
         return GvasPlayerKeymapResult({}, False, False, False, "候选文件不存在", selected)
